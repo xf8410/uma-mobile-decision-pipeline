@@ -11,7 +11,6 @@ import android.widget.TextView
 import androidx.activity.ComponentActivity
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files
@@ -51,10 +50,10 @@ class RawPackageDecodeActivity : ComponentActivity() {
         raw.walkTopDown().filter { it.isFile && !it.name.endsWith(".part") }.forEach { file ->
             val relative = raw.toPath().relativize(file.toPath()).toString()
             try {
-                val original = file.readBytes(); val result = decodeBytes(original)
+                val original = file.readBytes(); val decoded = decodeBytes(original)
                 val target = File(out, "$relative.json"); target.parentFile?.mkdirs()
-                val meta = JSONObject().apply { put("session_id", id); put("source_raw", "raw/$relative"); put("sha256", sha256(original)); put("format", result.format); put("decode_status", "success") }
-                val wrapped = JSONObject().apply { put("_meta", meta); put("data", result.value) }
+                val meta = JSONObject().apply { put("session_id", id); put("source_raw", "raw/$relative"); put("sha256", sha256(original)); put("format", decoded.format); put("decode_status", "success") }
+                val wrapped = JSONObject().apply { put("_meta", meta); put("data", decoded.value) }
                 atomicWrite(target, wrapped.toString(2).toByteArray(Charsets.UTF_8)); success++
             } catch (e: Exception) {
                 failed++; errors.append(JSONObject().apply { put("source_raw", "raw/$relative"); put("decode_status", "error"); put("error", "${e.javaClass.simpleName}: ${e.message.orEmpty()}") }.toString()).append('\n')
@@ -66,13 +65,13 @@ class RawPackageDecodeActivity : ComponentActivity() {
 
     private fun decodeBytes(original: ByteArray): Decoded {
         if (original.isEmpty()) return Decoded("empty", JSONObject())
-        val bytes = if (isGzip(original)) GZIPInputStream(original.inputStream()).use { it.readBytes() } else original
+        val compressed = isGzip(original)
+        val bytes = if (compressed) GZIPInputStream(original.inputStream()).use { it.readBytes() } else original
         val text = bytes.toString(Charsets.UTF_8).trimStart()
         if (text.startsWith("{") || text.startsWith("[")) {
-            return if (text.startsWith("{")) Decoded("json", JSONObject(text)) else Decoded("json", JSONArray(text))
+            return if (text.startsWith("{")) Decoded(if (compressed) "gzip+json" else "json", JSONObject(text)) else Decoded(if (compressed) "gzip+json" else "json", JSONArray(text))
         }
-        val value = MsgPack(bytes).read()
-        return Decoded(if (isGzip(original)) "gzip+msgpack" else "msgpack", value)
+        return Decoded(if (compressed) "gzip+msgpack" else "msgpack", MessagePackReader(bytes).read())
     }
 
     private fun isGzip(bytes: ByteArray) = bytes.size >= 2 && bytes[0].toInt() and 255 == 0x1f && bytes[1].toInt() and 255 == 0x8b
@@ -82,43 +81,47 @@ class RawPackageDecodeActivity : ComponentActivity() {
     override fun onDestroy() { executor.shutdownNow(); super.onDestroy() }
     private data class Decoded(val format: String, val value: Any)
 
-    private class MsgPack(private val b: ByteArray) {
-        private var p = 0
-        fun read(): Any { val c = u8(); return when {
-            c <= 0x7f -> c
-            c >= 0xe0 -> c - 256
-            c in 0xa0..0xbf -> readString(c - 0xa0)
-            c in 0x90..0x9f -> readArray(c - 0x90)
-            c in 0x80..0x8f -> readMap(c - 0x80)
-            c == 0xc0 -> JSONObject.NULL
-            c == 0xc2 -> false
-            c == 0xc3 -> true
-            c == 0xca -> java.lang.Float.intBitsToFloat(i32()).toDouble()
-            c == 0xcb -> java.lang.Double.longBitsToDouble(i64())
-            c == 0xcc -> u8()
-            c == 0xcd -> u16()
-            c == 0xce -> u32()
-            c == 0xcf -> i64()
-            c == 0xd0 -> i8()
-            c == 0xd1 -> i16()
-            c == 0xd2 -> i32()
-            c == 0xd3 -> i64()
-            c in 0xc4..0xc6 -> JSONObject().apply { put("_type", "binary"); put("base64", Base64.encodeToString(readBytes(if (c == 0xc4) u8() else if (c == 0xc5) u16() else u32().toInt()), Base64.NO_WRAP)) }
-            c in 0xd9..0xdb -> readString(if (c == 0xd9) u8() else if (c == 0xda) u16() else u32().toInt())
-            c in 0xdc..0xdd -> readArray(if (c == 0xdc) u16() else u32().toInt())
-            c in 0xde..0xdf -> readMap(if (c == 0xde) u16() else u32().toInt())
-            else -> throw IllegalStateException("unsupported MessagePack marker 0x${c.toString(16)} at $p")
-        } }
-        private fun readArray(n: Int): JSONArray { val a = JSONArray(); repeat(n) { a.put(read()) }; return a }
-        private fun readMap(n: Int): JSONObject { val o = JSONObject(); repeat(n) { val key = read().toString(); o.put(key, read()) }; return o }
-        private fun readString(n: Int): String = String(readBytes(n), Charsets.UTF_8)
-        private fun readBytes(n: Int): ByteArray { if (n < 0 || p + n > b.size) throw IllegalStateException("truncated MessagePack payload"); return b.copyOfRange(p, p + n).also { p += n } }
-        private fun u8() = readBytes(1)[0].toInt() and 255
-        private fun i8() = readBytes(1)[0].toInt()
-        private fun u16() = (u8() shl 8) or u8()
-        private fun i16() = (u16() shl 16 shr 16)
-        private fun u32() = ((u8().toLong() shl 24) or (u8().toLong() shl 16) or (u8().toLong() shl 8) or u8()).toInt()
-        private fun i32() = u32()
-        private fun i64(): Long { var x = 0L; repeat(8) { x = (x shl 8) or u8().toLong() }; return x }
+    private class MessagePackReader(private val bytes: ByteArray) {
+        private var position = 0
+        fun read(): Any {
+            val code = readU8()
+            return when {
+                code <= 0x7f -> code
+                code >= 0xe0 -> code - 256
+                code in 0xa0..0xbf -> readString(code - 0xa0)
+                code in 0x90..0x9f -> readArray(code - 0x90)
+                code in 0x80..0x8f -> readMap(code - 0x80)
+                code == 0xc0 -> JSONObject.NULL
+                code == 0xc2 -> false
+                code == 0xc3 -> true
+                code == 0xca -> Float.fromBits(readI32()).toDouble()
+                code == 0xcb -> Double.fromBits(readI64())
+                code == 0xcc -> readU8()
+                code == 0xcd -> readU16()
+                code == 0xce -> readU32()
+                code == 0xcf -> readI64()
+                code == 0xd0 -> readI8()
+                code == 0xd1 -> readI16()
+                code == 0xd2 -> readI32()
+                code == 0xd3 -> readI64()
+                code in 0xc4..0xc6 -> readBinary(code)
+                code in 0xd9..0xdb -> readString(if (code == 0xd9) readU8() else if (code == 0xda) readU16() else readU32())
+                code in 0xdc..0xdd -> readArray(if (code == 0xdc) readU16() else readU32())
+                code in 0xde..0xdf -> readMap(if (code == 0xde) readU16() else readU32())
+                else -> throw IllegalStateException("unsupported MessagePack marker 0x${code.toString(16)} at $position")
+            }
+        }
+        private fun readBinary(code: Int): JSONObject { val length = if (code == 0xc4) readU8() else if (code == 0xc5) readU16() else readU32(); return JSONObject().apply { put("_type", "binary"); put("base64", Base64.encodeToString(readBytes(length), Base64.NO_WRAP)) } }
+        private fun readArray(count: Int): JSONArray { if (count < 0) throw IllegalStateException("negative array length"); val result = JSONArray(); repeat(count) { result.put(read()) }; return result }
+        private fun readMap(count: Int): JSONObject { if (count < 0) throw IllegalStateException("negative map length"); val result = JSONObject(); repeat(count) { result.put(read().toString(), read()) }; return result }
+        private fun readString(length: Int): String = String(readBytes(length), Charsets.UTF_8)
+        private fun readBytes(length: Int): ByteArray { if (length < 0 || position > bytes.size - length) throw IllegalStateException("truncated MessagePack payload"); return bytes.copyOfRange(position, position + length).also { position += length } }
+        private fun readU8(): Int = readBytes(1)[0].toInt() and 255
+        private fun readI8(): Int = readBytes(1)[0].toInt()
+        private fun readU16(): Int = (readU8() shl 8) or readU8()
+        private fun readI16(): Int = (readU16() shl 16) shr 16
+        private fun readU32(): Int = ((readU8().toLong() shl 24) or (readU8().toLong() shl 16) or (readU8().toLong() shl 8) or readU8().toLong()).toInt()
+        private fun readI32(): Int = readU32()
+        private fun readI64(): Long { var value = 0L; repeat(8) { value = (value shl 8) or readU8().toLong() }; return value }
     }
 }
