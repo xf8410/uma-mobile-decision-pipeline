@@ -28,16 +28,52 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
+      - name: Restore or create the persistent collector signing key
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release download collector-signing-key --pattern collector-upload-key.p12 --dir .; then
+            echo 'signing_key_source=existing_release' >> "$GITHUB_ENV"
+          else
+            keytool -genkeypair -noprompt \
+              -keystore collector-upload-key.p12 -storetype PKCS12 \
+              -storepass uma-collector-stable -keypass uma-collector-stable \
+              -alias uma-collector -keyalg RSA -keysize 3072 -validity 36500 \
+              -dname 'CN=Uma Collector, OU=Mobile Collector, O=xf8410, C=CN'
+            gh release create collector-signing-key \
+              --target '${{ steps.source.outputs.sha }}' \
+              --title 'Uma Collector persistent signing identity' \
+              --notes 'Persistent signing key used by every subsequent Uma Collector APK release.' \
+              collector-upload-key.p12
+            echo 'signing_key_source=created_once' >> "$GITHUB_ENV"
+          fi
       - name: Test and build exact source
         run: |
           gradle :app:testDebugUnitTest :app:assembleDebug --stacktrace
           test "$(git rev-parse HEAD)" = "${{ steps.source.outputs.sha }}"
-      - name: Create immutable APK package
+      - name: Re-sign APK with persistent identity
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk uma-collector-${{ steps.source.outputs.sha }}.apk
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+          cp app/build/outputs/apk/debug/app-debug.apk unsigned.apk
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks collector-upload-key.p12 \
+            --ks-type PKCS12 \
+            --ks-key-alias uma-collector \
+            --ks-pass pass:uma-collector-stable \
+            --key-pass pass:uma-collector-stable \
+            --out uma-collector-${{ steps.source.outputs.sha }}.apk \
+            unsigned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs \
+            uma-collector-${{ steps.source.outputs.sha }}.apk | tee SIGNING-CERTIFICATE.txt
+          grep -q 'Verified' SIGNING-CERTIFICATE.txt
+          grep 'Signer #1 certificate SHA-256 digest:' SIGNING-CERTIFICATE.txt | \
+            sed 's/^/expected_/' > SIGNING-IDENTITY.txt
+      - name: Create immutable APK package metadata
+        run: |
           sha256sum uma-collector-${{ steps.source.outputs.sha }}.apk > SHA256SUMS
-          printf 'source_sha=%s\nworkflow_run=%s\n' \
-            '${{ steps.source.outputs.sha }}' '${{ github.run_id }}' > BUILD-MANIFEST.txt
+          printf 'source_sha=%s\nworkflow_run=%s\nsigning_key_source=%s\n' \
+            '${{ steps.source.outputs.sha }}' '${{ github.run_id }}' '${{ env.signing_key_source }}' \
+            > BUILD-MANIFEST.txt
       - name: Publish prerelease for this exact SHA
         env:
           GH_TOKEN: ${{ github.token }}
@@ -45,6 +81,7 @@ jobs:
           gh release create '${{ steps.source.outputs.tag }}' \
             --target '${{ steps.source.outputs.sha }}' \
             --title 'Uma Collector debug ${{ steps.source.outputs.sha }}' \
-            --notes 'Debug APK built from the exact source SHA recorded in BUILD-MANIFEST.txt.' \
+            --notes 'APK signed with the persistent certificate recorded in SIGNING-IDENTITY.txt.' \
             --prerelease \
-            uma-collector-${{ steps.source.outputs.sha }}.apk SHA256SUMS BUILD-MANIFEST.txt
+            uma-collector-${{ steps.source.outputs.sha }}.apk \
+            SHA256SUMS BUILD-MANIFEST.txt SIGNING-CERTIFICATE.txt SIGNING-IDENTITY.txt
