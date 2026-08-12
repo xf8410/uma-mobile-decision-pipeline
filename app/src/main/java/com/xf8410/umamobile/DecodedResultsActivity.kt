@@ -118,13 +118,13 @@ class DecodedResultsActivity : ComponentActivity() {
         }
         val derived = File(root, "derived")
         atomicWrite(File(derived, "training-state.jsonl"), lines(output))
-        atomicWrite(File(derived, "training-state-errors.json"), errors.toString())
+        atomicWrite(File(derived, "training-state-errors.json"), errors.toString().toByteArray(Charsets.UTF_8))
         atomicWrite(File(derived, "training-state-manifest.json"), JSONObject().apply {
             put("schema_version", 1); put("session_id", sessionId); put("source", "decoded/files"); put("raw_preserved", true)
             put("decoded_preserved", true); put("files_inspected", inspected); put("states_emitted", matched); put("errors", errors.length())
             put("selection_gate", "same data object contains chara_info and at least one *_data_set")
             put("field_policy", "source-linked values only; missing values remain null; no raw fields are removed")
-        }.toString())
+        }.toString().toByteArray(Charsets.UTF_8))
         return "TrainingState 证据生成完成\nsession_id=$sessionId\nfiles_inspected=$inspected\nstates_emitted=$matched\nerrors=${errors.length()}\nderived/training-state.jsonl\nderived/training-state-manifest.json\nderived/training-state-errors.json"
     }
 
