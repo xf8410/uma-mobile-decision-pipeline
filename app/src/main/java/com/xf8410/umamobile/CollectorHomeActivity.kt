@@ -8,13 +8,10 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
 
 class CollectorHomeActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        title = "Uma Collector"
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(32, 48, 32, 32)
@@ -23,19 +20,12 @@ class CollectorHomeActivity : ComponentActivity() {
                 textSize = 22f
                 setPadding(0, 0, 0, 32)
             }, matchWidth())
+            addView(actionButton("选择历史 Session", SessionSelectionActivity::class.java), matchWidth())
             addView(actionButton("连接 SO、开启 Hook 与同步", MainActivity::class.java), matchWidth())
             addView(actionButton("验证最新本地 Session", VerifySessionActivity::class.java), matchWidth())
             addView(actionButton("重新读取 SO 索引并终验", RemoteVerificationActivity::class.java), matchWidth())
         }
-        val root = ScrollView(this).apply {
-            addView(layout)
-            ViewCompat.setOnApplyWindowInsetsListener(this) { view, insets ->
-                val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-                view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
-                insets
-            }
-        }
-        setContentView(root)
+        setContentView(ScrollView(this).apply { addView(layout) })
     }
 
     private fun actionButton(label: String, target: Class<*>) = Button(this).apply {
