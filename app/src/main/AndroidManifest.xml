@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
     <application android:name=".CollectorApplication" android:allowBackup="false" android:label="Uma Collector" android:supportsRtl="true" android:theme="@style/Theme.UmaCollector" android:usesCleartextTraffic="true">
+        <activity android:name=".CompleteSessionExportActivity" android:exported="false" />
         <activity android:name=".DecodedResultsActivity" android:exported="false" />
         <activity android:name=".RawPackageDecodeActivity" android:exported="false" />
         <activity android:name=".RawFormatIdentificationActivity" android:exported="false" />
