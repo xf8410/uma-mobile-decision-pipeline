@@ -8,21 +8,12 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.UmaCollector"
         android:usesCleartextTraffic="true">
-        <activity
-            android:name=".SessionSelectionActivity"
-            android:exported="false" />
-        <activity
-            android:name=".RemoteVerificationActivity"
-            android:exported="false" />
-        <activity
-            android:name=".VerifySessionActivity"
-            android:exported="false" />
-        <activity
-            android:name=".MainActivity"
-            android:exported="false" />
-        <activity
-            android:name=".CollectorHomeActivity"
-            android:exported="true">
+        <activity android:name=".LocalSnapshotVerificationActivity" android:exported="false" />
+        <activity android:name=".SessionSelectionActivity" android:exported="false" />
+        <activity android:name=".RemoteVerificationActivity" android:exported="false" />
+        <activity android:name=".VerifySessionActivity" android:exported="false" />
+        <activity android:name=".MainActivity" android:exported="false" />
+        <activity android:name=".CollectorHomeActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
