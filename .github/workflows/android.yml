@@ -27,6 +27,8 @@ jobs:
         run: gradle :app:processDebugResources --stacktrace
       - name: Compile Kotlin
         run: gradle :app:compileDebugKotlin --stacktrace
+      - name: Test debug unit tests
+        run: gradle :app:testDebugUnitTest --stacktrace
       - name: Assemble debug APK
         run: gradle :app:assembleDebug --stacktrace
       - name: Verify debug APK
