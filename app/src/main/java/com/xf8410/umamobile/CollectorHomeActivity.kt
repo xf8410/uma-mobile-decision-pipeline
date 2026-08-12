@@ -20,16 +20,16 @@ class CollectorHomeActivity : ComponentActivity() {
                 textSize = 22f
                 setPadding(0, 0, 0, 32)
             }, matchWidth())
-            addView(Button(context).apply {
-                text = "连接 SO、开启 Hook 与同步"
-                setOnClickListener { startActivity(Intent(context, MainActivity::class.java)) }
-            }, matchWidth())
-            addView(Button(context).apply {
-                text = "验证最新本地 Session"
-                setOnClickListener { startActivity(Intent(context, VerifySessionActivity::class.java)) }
-            }, matchWidth())
+            addView(actionButton("连接 SO、开启 Hook 与同步", MainActivity::class.java), matchWidth())
+            addView(actionButton("验证最新本地 Session", VerifySessionActivity::class.java), matchWidth())
+            addView(actionButton("重新读取 SO 索引并终验", RemoteVerificationActivity::class.java), matchWidth())
         }
         setContentView(layout)
+    }
+
+    private fun actionButton(label: String, target: Class<*>) = Button(this).apply {
+        text = label
+        setOnClickListener { startActivity(Intent(context, target)) }
     }
 
     private fun matchWidth() = LinearLayout.LayoutParams(
