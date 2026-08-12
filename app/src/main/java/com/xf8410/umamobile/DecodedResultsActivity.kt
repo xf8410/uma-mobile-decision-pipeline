@@ -82,7 +82,7 @@ class DecodedResultsActivity : ComponentActivity() {
                 val wrapper = JSONTokener(file.readText(Charsets.UTF_8)).nextValue()
                 val data = if (wrapper is JSONObject && wrapper.has("data")) wrapper.opt("data") else wrapper
                 val rootObject = data as? JSONObject ?: return@forEach
-                val dataSetKeys = rootObject.keys().asSequence().filter { it.endsWith("_data_set") }.toList()
+                val dataSetKeys = jsonObjectKeys(rootObject).filter { it.endsWith("_data_set") }
                 val chara = findObject(rootObject, "chara_info") ?: return@forEach
                 if (dataSetKeys.isEmpty()) return@forEach
                 matched++
@@ -130,9 +130,16 @@ class DecodedResultsActivity : ComponentActivity() {
 
     private fun evidenceRefs(relative: String, chara: JSONObject, dataSetKeys: List<String>): JSONArray {
         val refs = JSONArray()
-        refs.put(JSONObject().apply { put("source_file", relative); put("source_path", "data.chara_info"); put("fields_present", jsonArrayOfStrings(chara.keys().asSequence().toList())) })
+        refs.put(JSONObject().apply { put("source_file", relative); put("source_path", "data.chara_info"); put("fields_present", jsonArrayOfStrings(jsonObjectKeys(chara))) })
         dataSetKeys.forEach { key -> refs.put(JSONObject().apply { put("source_file", relative); put("source_path", "data.$key") }) }
         return refs
+    }
+
+    private fun jsonObjectKeys(value: JSONObject): List<String> {
+        val result = ArrayList<String>()
+        val keys = value.keys()
+        while (keys.hasNext()) result += keys.next()
+        return result
     }
 
     private fun jsonArrayOfStrings(values: List<String>): JSONArray {
