@@ -1,0 +1,50 @@
+name: Publish debug APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Capture exact source identity
+        id: source
+        run: |
+          SHA="$(git rev-parse HEAD)"
+          SHORT="$(git rev-parse --short=12 HEAD)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=collector-debug-$SHORT" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Test and build exact source
+        run: |
+          gradle :app:testDebugUnitTest :app:assembleDebug --stacktrace
+          test "$(git rev-parse HEAD)" = "${{ steps.source.outputs.sha }}"
+      - name: Create immutable APK package
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk uma-collector-${{ steps.source.outputs.sha }}.apk
+          sha256sum uma-collector-${{ steps.source.outputs.sha }}.apk > SHA256SUMS
+          printf 'source_sha=%s\nworkflow_run=%s\n' \
+            '${{ steps.source.outputs.sha }}' '${{ github.run_id }}' > BUILD-MANIFEST.txt
+      - name: Publish prerelease for this exact SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create '${{ steps.source.outputs.tag }}' \
+            --target '${{ steps.source.outputs.sha }}' \
+            --title 'Uma Collector debug ${{ steps.source.outputs.sha }}' \
+            --notes 'Debug APK built from the exact source SHA recorded in BUILD-MANIFEST.txt.' \
+            --prerelease \
+            uma-collector-${{ steps.source.outputs.sha }}.apk SHA256SUMS BUILD-MANIFEST.txt
