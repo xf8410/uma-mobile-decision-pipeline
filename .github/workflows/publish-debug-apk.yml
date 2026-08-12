@@ -48,9 +48,6 @@ jobs:
               collector-upload-key.p12
             echo 'signing_key_source=created_once' >> "$GITHUB_ENV"
           fi
-          gh api --method PATCH \
-            "repos/${GITHUB_REPOSITORY}/releases/tags/collector-signing-key" \
-            -F prerelease=true -f make_latest=false >/dev/null
       - name: Test and build exact source
         run: |
           gradle :app:testDebugUnitTest :app:assembleDebug --stacktrace
@@ -78,7 +75,7 @@ jobs:
           printf 'source_sha=%s\nworkflow_run=%s\nsigning_key_source=%s\n' \
             '${{ steps.source.outputs.sha }}' '${{ github.run_id }}' '${{ env.signing_key_source }}' \
             > BUILD-MANIFEST.txt
-      - name: Publish the APK as the latest release
+      - name: Publish APK release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -96,6 +93,3 @@ jobs:
               uma-collector-${{ steps.source.outputs.sha }}.apk \
               SHA256SUMS BUILD-MANIFEST.txt SIGNING-CERTIFICATE.txt SIGNING-IDENTITY.txt
           fi
-          gh api --method PATCH \
-            "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
-            -F prerelease=false -F draft=false -f make_latest=true >/dev/null

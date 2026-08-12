@@ -5,8 +5,8 @@
         android:allowBackup="false"
         android:label="Uma Collector"
         android:supportsRtl="true"
-        android:usesCleartextTraffic="true"
-        android:windowOptOutEdgeToEdgeEnforcement="true">
+        android:theme="@style/Theme.UmaCollector"
+        android:usesCleartextTraffic="true">
         <activity
             android:name=".RemoteVerificationActivity"
             android:exported="false" />
