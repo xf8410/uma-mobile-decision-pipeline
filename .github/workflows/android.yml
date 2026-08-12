@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -25,19 +28,32 @@ jobs:
         run: gradle :app:dependencies --configuration debugRuntimeClasspath --stacktrace
       - name: Process Android resources
         run: gradle :app:processDebugResources --stacktrace
-      - name: Compile Kotlin
+      - name: Compile Kotlin and capture exact diagnostics
+        id: kotlin_compile
+        continue-on-error: true
         shell: bash
         run: |
           set -o pipefail
           gradle :app:compileDebugKotlin --stacktrace --info 2>&1 | tee kotlin-compile.log
-      - name: Upload Kotlin compiler diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kotlin-compile-diagnostics-${{ github.sha }}
-          path: kotlin-compile.log
-          if-no-files-found: error
-          retention-days: 7
+      - name: Persist failed Kotlin diagnostics on current workbench branch
+        if: steps.kotlin_compile.outcome == 'failure' && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_BRANCH: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          test -s kotlin-compile.log
+          mkdir -p ci-diagnostics
+          cp kotlin-compile.log "ci-diagnostics/kotlin-compile-${SOURCE_SHA}.log"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add "ci-diagnostics/kotlin-compile-${SOURCE_SHA}.log"
+          git commit -m "Persist Kotlin diagnostics for ${SOURCE_SHA} [skip ci]"
+          git push origin "HEAD:${SOURCE_BRANCH}"
+      - name: Fail after Kotlin diagnostics are persisted
+        if: steps.kotlin_compile.outcome == 'failure'
+        run: exit 1
       - name: Test debug unit tests
         run: gradle :app:testDebugUnitTest --stacktrace
       - name: Assemble debug APK
