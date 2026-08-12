@@ -9,6 +9,9 @@
         android:theme="@style/Theme.UmaCollector"
         android:usesCleartextTraffic="true">
         <activity
+            android:name=".SessionSelectionActivity"
+            android:exported="false" />
+        <activity
             android:name=".RemoteVerificationActivity"
             android:exported="false" />
         <activity
