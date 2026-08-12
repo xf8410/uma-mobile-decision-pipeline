@@ -10,6 +10,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import org.json.JSONArray
+import org.json.JSONTokener
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -37,7 +38,7 @@ class RawPackageDecodeActivity : ComponentActivity() {
     private fun startDecode() {
         status.text = "正在解码 raw，原始文件不会修改……"
         executor.execute {
-            val result = runCatching { decodeSession() }.fold({ it }, { e -> "解码失败\n${e.javaClass.simpleName}: ${e.message.orEmpty()}" })
+            val result = try { decodeSession() } catch (e: Exception) { "解码失败\n${e.javaClass.simpleName}: ${e.message.orEmpty()}" }
             runOnUiThread { status.text = result }
         }
     }
@@ -67,13 +68,15 @@ class RawPackageDecodeActivity : ComponentActivity() {
         if (original.isEmpty()) return Decoded("empty", JSONObject())
         val compressed = isGzip(original)
         val bytes = if (compressed) GZIPInputStream(original.inputStream()).use { it.readBytes() } else original
-        val text = bytes.toString(Charsets.UTF_8).trimStart()
-        if (text.startsWith("{") || text.startsWith("[")) {
-            return if (text.startsWith("{")) Decoded(if (compressed) "gzip+json" else "json", JSONObject(text)) else Decoded(if (compressed) "gzip+json" else "json", JSONArray(text))
+        val text = utf8Text(bytes)?.trimStart('\uFEFF', ' ', '\t', '\r', '\n')
+        if (text != null) {
+            val parsed = try { JSONTokener(text).nextValue() } catch (_: Exception) { null }
+            if (parsed != null && parsed !== JSONObject.NULL) return Decoded(if (compressed) "gzip+json" else "json", parsed)
         }
         return Decoded(if (compressed) "gzip+msgpack" else "msgpack", MessagePackReader(bytes).read())
     }
 
+    private fun utf8Text(bytes: ByteArray): String? = try { bytes.toString(Charsets.UTF_8) } catch (_: Exception) { null }
     private fun isGzip(bytes: ByteArray) = bytes.size >= 2 && bytes[0].toInt() and 255 == 0x1f && bytes[1].toInt() and 255 == 0x8b
     private fun sha256(bytes: ByteArray): String { val d = MessageDigest.getInstance("SHA-256"); d.update(bytes); return d.digest().joinToString("") { "%02x".format(it) } }
     private fun atomicWrite(target: File, bytes: ByteArray) { target.parentFile?.mkdirs(); val part = File(target.parentFile, target.name + ".part"); FileOutputStream(part).use { it.write(bytes); it.fd.sync() }; try { Files.move(part.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING) } catch (_: Exception) { Files.move(part.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING) } }
