@@ -44,9 +44,13 @@ jobs:
               --target '${{ steps.source.outputs.sha }}' \
               --title 'Uma Collector persistent signing identity' \
               --notes 'Persistent signing key used by every subsequent Uma Collector APK release.' \
+              --prerelease \
               collector-upload-key.p12
             echo 'signing_key_source=created_once' >> "$GITHUB_ENV"
           fi
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/collector-signing-key" \
+            -F prerelease=true -f make_latest=false >/dev/null
       - name: Test and build exact source
         run: |
           gradle :app:testDebugUnitTest :app:assembleDebug --stacktrace
@@ -74,14 +78,24 @@ jobs:
           printf 'source_sha=%s\nworkflow_run=%s\nsigning_key_source=%s\n' \
             '${{ steps.source.outputs.sha }}' '${{ github.run_id }}' '${{ env.signing_key_source }}' \
             > BUILD-MANIFEST.txt
-      - name: Publish prerelease for this exact SHA
+      - name: Publish the APK as the latest release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create '${{ steps.source.outputs.tag }}' \
-            --target '${{ steps.source.outputs.sha }}' \
-            --title 'Uma Collector debug ${{ steps.source.outputs.sha }}' \
-            --notes 'APK signed with the persistent certificate recorded in SIGNING-IDENTITY.txt.' \
-            --prerelease \
-            uma-collector-${{ steps.source.outputs.sha }}.apk \
-            SHA256SUMS BUILD-MANIFEST.txt SIGNING-CERTIFICATE.txt SIGNING-IDENTITY.txt
+          TAG='${{ steps.source.outputs.tag }}'
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              uma-collector-${{ steps.source.outputs.sha }}.apk \
+              SHA256SUMS BUILD-MANIFEST.txt SIGNING-CERTIFICATE.txt SIGNING-IDENTITY.txt \
+              --clobber
+          else
+            gh release create "$TAG" \
+              --target '${{ steps.source.outputs.sha }}' \
+              --title 'Uma Collector ${{ steps.source.outputs.sha }}' \
+              --notes 'APK signed with the persistent certificate recorded in SIGNING-IDENTITY.txt.' \
+              uma-collector-${{ steps.source.outputs.sha }}.apk \
+              SHA256SUMS BUILD-MANIFEST.txt SIGNING-CERTIFICATE.txt SIGNING-IDENTITY.txt
+          fi
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+            -F prerelease=false -F draft=false -f make_latest=true >/dev/null
