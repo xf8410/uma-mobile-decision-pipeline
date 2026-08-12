@@ -165,7 +165,7 @@ class DecodedResultsActivity : ComponentActivity() {
 
     private fun valueOrNull(objectValue: JSONObject, vararg keys: String): Any {
         for (key in keys) {
-            if (objectValue.has(key) && !objectValue.isNull(key)) return objectValue.opt(key)
+            if (objectValue.has(key) && !objectValue.isNull(key)) return objectValue.opt(key) ?: JSONObject.NULL
         }
         return JSONObject.NULL
     }
