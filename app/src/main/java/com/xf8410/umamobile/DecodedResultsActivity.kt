@@ -82,8 +82,8 @@ class DecodedResultsActivity : ComponentActivity() {
                 val wrapper = JSONTokener(file.readText(Charsets.UTF_8)).nextValue()
                 val data = if (wrapper is JSONObject && wrapper.has("data")) wrapper.opt("data") else wrapper
                 val rootObject = data as? JSONObject ?: return@forEach
-                val chara = findObject(rootObject, "chara_info") ?: return@forEach
                 val dataSetKeys = rootObject.keys().asSequence().filter { it.endsWith("_data_set") }.toList()
+                val chara = findObject(rootObject, "chara_info") ?: return@forEach
                 if (dataSetKeys.isEmpty()) return@forEach
                 matched++
                 val state = JSONObject().apply {
@@ -106,7 +106,7 @@ class DecodedResultsActivity : ComponentActivity() {
                     put("max_wisdom", valueOrNull(chara, "max_wiz", "max_wisdom"))
                     put("vital", valueOrNull(chara, "vital"))
                     put("max_vital", valueOrNull(chara, "max_vital"))
-                    put("training_data_sets", JSONArray(dataSetKeys))
+                    put("training_data_sets", jsonArrayOfStrings(dataSetKeys))
                     put("event_data", valueOrNull(rootObject, "unchecked_event_array"))
                     put("mapping_status", "confirmed-source-candidate-values")
                     put("evidence_refs", evidenceRefs(relative, chara, dataSetKeys))
@@ -130,9 +130,15 @@ class DecodedResultsActivity : ComponentActivity() {
 
     private fun evidenceRefs(relative: String, chara: JSONObject, dataSetKeys: List<String>): JSONArray {
         val refs = JSONArray()
-        refs.put(JSONObject().apply { put("source_file", relative); put("source_path", "data.chara_info"); put("fields_present", JSONArray(chara.keys().asSequence().toList())) })
+        refs.put(JSONObject().apply { put("source_file", relative); put("source_path", "data.chara_info"); put("fields_present", jsonArrayOfStrings(chara.keys().asSequence().toList())) })
         dataSetKeys.forEach { key -> refs.put(JSONObject().apply { put("source_file", relative); put("source_path", "data.$key") }) }
         return refs
+    }
+
+    private fun jsonArrayOfStrings(values: List<String>): JSONArray {
+        val result = JSONArray()
+        values.forEach { result.put(it) }
+        return result
     }
 
     private fun sourceRawFromWrapper(wrapper: Any?, relative: String): String =
@@ -150,8 +156,12 @@ class DecodedResultsActivity : ComponentActivity() {
         return null
     }
 
-    private fun valueOrNull(objectValue: JSONObject, vararg keys: String): Any =
-        keys.firstNotNullOfOrNull { key -> if (objectValue.has(key) && !objectValue.isNull(key)) objectValue.opt(key) else null } ?: JSONObject.NULL
+    private fun valueOrNull(objectValue: JSONObject, vararg keys: String): Any {
+        for (key in keys) {
+            if (objectValue.has(key) && !objectValue.isNull(key)) return objectValue.opt(key)
+        }
+        return JSONObject.NULL
+    }
 
     private fun lines(array: JSONArray): ByteArray = buildString { for (index in 0 until array.length()) append(array.getJSONObject(index).toString()).append('\n') }.toByteArray(Charsets.UTF_8)
 
