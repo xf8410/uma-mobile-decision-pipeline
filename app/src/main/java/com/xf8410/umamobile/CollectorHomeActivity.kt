@@ -23,6 +23,7 @@ class CollectorHomeActivity : ComponentActivity() {
             addView(actionButton("识别已下载 Session 原始包", RawFormatIdentificationActivity::class.java), matchWidth())
             addView(actionButton("解码已识别原始包为 JSON", RawPackageDecodeActivity::class.java), matchWidth())
             addView(actionButton("查看当前 Session 解码结果", DecodedResultsActivity::class.java), matchWidth())
+            addView(actionButton("导出完整 Session（不脱敏）", CompleteSessionExportActivity::class.java), matchWidth())
             addView(actionButton("验证最新本地 Session", VerifySessionActivity::class.java), matchWidth())
             addView(actionButton("重新读取 SO 索引并终验", RemoteVerificationActivity::class.java), matchWidth())
         }
