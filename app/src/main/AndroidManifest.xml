@@ -7,6 +7,9 @@
         android:supportsRtl="true"
         android:usesCleartextTraffic="true">
         <activity
+            android:name=".RemoteVerificationActivity"
+            android:exported="false" />
+        <activity
             android:name=".VerifySessionActivity"
             android:exported="false" />
         <activity
