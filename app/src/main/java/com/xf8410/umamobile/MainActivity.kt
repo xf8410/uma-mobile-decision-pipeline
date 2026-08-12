@@ -12,6 +12,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
@@ -19,6 +20,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var statusText: TextView
     private lateinit var healthButton: Button
     private lateinit var hookButton: Button
+    private lateinit var sessionsButton: Button
+    private val operationButtons = ArrayList<Button>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -31,23 +34,25 @@ class MainActivity : ComponentActivity() {
             setTextIsSelectable(true)
             setPadding(24, 24, 24, 48)
         }
-        healthButton = Button(this).apply {
-            text = "检查 SO 健康与状态"
-            setOnClickListener { checkHealth() }
-        }
-        hookButton = Button(this).apply {
-            text = "按固定顺序开启 Hook"
-            setOnClickListener { enableHooks() }
-        }
+        healthButton = operationButton("检查 SO 健康与状态") { checkHealth() }
+        hookButton = operationButton("按固定顺序开启 Hook") { enableHooks() }
+        sessionsButton = operationButton("读取 Session 与完整文件索引") { loadSessions() }
 
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 32, 24, 24)
             addView(healthButton, matchWidth())
             addView(hookButton, matchWidth())
+            addView(sessionsButton, matchWidth())
             addView(statusText, matchWidth())
         }
         setContentView(ScrollView(this).apply { addView(content) })
+    }
+
+    private fun operationButton(label: String, action: () -> Unit) = Button(this).apply {
+        text = label
+        setOnClickListener { action() }
+        operationButtons += this
     }
 
     private fun matchWidth() = LinearLayout.LayoutParams(
@@ -82,13 +87,10 @@ class MainActivity : ComponentActivity() {
         for (path in steps) {
             val response = get(path)
             responses += response
-            if (response.code !in 200..299) {
-                throw IllegalStateException("GET $path → HTTP ${response.code}\n${response.body}")
-            }
+            requireSuccess(path, response)
         }
 
-        val finalBody = responses.last().body
-        val diagnostic = JSONObject(finalBody)
+        val diagnostic = JSONObject(responses.last().body)
         val required = linkedMapOf(
             "compress.hooked" to findBoolean(diagnostic, "compress", "hooked"),
             "decompress.hooked" to findBoolean(diagnostic, "decompress", "hooked"),
@@ -105,11 +107,79 @@ class MainActivity : ComponentActivity() {
                 appendLine()
             }
             required.forEach { (name, value) -> appendLine("$name=$value") }
-            if (failed.isEmpty()) {
-                append("Hook 最终诊断通过")
-            } else {
-                append("Hook 最终诊断未通过：${failed.joinToString()}")
+            if (failed.isEmpty()) append("Hook 最终诊断通过")
+            else append("Hook 最终诊断未通过：${failed.joinToString()}")
+        }
+    }
+
+    private fun loadSessions() = runOperation("正在读取 Session 与分页文件索引……") {
+        val response = get("/storage/sessions")
+        requireSuccess("/storage/sessions", response)
+        val root = JSONObject(response.body)
+        if (!root.optBoolean("ok", false)) {
+            throw IllegalStateException(response.body)
+        }
+        val sessions = root.optJSONArray("sessions") ?: JSONArray()
+        var allFiles = 0L
+        var allBytes = 0L
+        buildString {
+            appendLine("Session 数量：${sessions.length()}")
+            appendLine()
+            for (index in 0 until sessions.length()) {
+                val session = sessions.getJSONObject(index)
+                val sessionId = session.getString("session_id")
+                val files = loadAllFilePages(sessionId)
+                allFiles += files.count
+                allBytes += files.bytes
+                appendLine("[$sessionId]")
+                appendLine("state=${session.optString("state", "unknown")}")
+                appendLine("plugin_version=${session.optString("plugin_version", "unknown")}")
+                appendLine("files=${files.count}, bytes=${files.bytes}, pages=${files.pages}")
+                appendLine("first_file_id=${files.firstFileId ?: "none"}, last_file_id=${files.lastFileId ?: "none"}")
+                appendLine()
             }
+            append("合计 files=$allFiles, bytes=$allBytes")
+        }
+    }
+
+    private fun loadAllFilePages(sessionId: String): FileIndexSummary {
+        val encoded = URLEncoder.encode(sessionId, Charsets.UTF_8.name())
+        var cursor = 0L
+        var pages = 0
+        var count = 0L
+        var bytes = 0L
+        var firstFileId: Long? = null
+        var lastFileId: Long? = null
+        while (true) {
+            val path = "/storage/files?session_id=$encoded&cursor=$cursor&limit=1000"
+            val response = get(path)
+            requireSuccess(path, response)
+            val root = JSONObject(response.body)
+            if (!root.optBoolean("ok", false)) throw IllegalStateException(response.body)
+            val files = root.optJSONArray("files") ?: JSONArray()
+            pages += 1
+            for (index in 0 until files.length()) {
+                val file = files.getJSONObject(index)
+                val fileId = file.getLong("file_id")
+                val byteLength = file.getLong("byte_length")
+                if (byteLength < 0L) throw IllegalStateException("negative byte_length for file_id=$fileId")
+                if (firstFileId == null) firstFileId = fileId
+                lastFileId = fileId
+                count += 1
+                bytes = Math.addExact(bytes, byteLength)
+            }
+            val nextCursor = root.getLong("next_cursor")
+            if (files.length() == 0) break
+            if (nextCursor <= cursor) throw IllegalStateException("file cursor did not advance: $cursor → $nextCursor")
+            cursor = nextCursor
+            if (files.length() < 1000) break
+        }
+        return FileIndexSummary(pages, count, bytes, firstFileId, lastFileId)
+    }
+
+    private fun requireSuccess(path: String, response: HttpResult) {
+        if (response.code !in 200..299) {
+            throw IllegalStateException("GET $path → HTTP ${response.code}\n${response.body}")
         }
     }
 
@@ -125,8 +195,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun setBusy(busy: Boolean, message: String) {
-        healthButton.isEnabled = !busy
-        hookButton.isEnabled = !busy
+        operationButtons.forEach { it.isEnabled = !busy }
         statusText.text = message
     }
 
@@ -151,13 +220,9 @@ class MainActivity : ComponentActivity() {
         val remaining = path.drop(1).toTypedArray()
         when (root) {
             is JSONObject -> {
-                if (root.has(key)) {
-                    findBoolean(root.opt(key), *remaining)?.let { return it }
-                }
+                if (root.has(key)) findBoolean(root.opt(key), *remaining)?.let { return it }
                 val keys = root.keys()
-                while (keys.hasNext()) {
-                    findBoolean(root.opt(keys.next()), *path)?.let { return it }
-                }
+                while (keys.hasNext()) findBoolean(root.opt(keys.next()), *path)?.let { return it }
             }
             is JSONArray -> for (index in 0 until root.length()) {
                 findBoolean(root.opt(index), *path)?.let { return it }
@@ -172,4 +237,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private data class HttpResult(val code: Int, val body: String)
+    private data class FileIndexSummary(
+        val pages: Int,
+        val count: Long,
+        val bytes: Long,
+        val firstFileId: Long?,
+        val lastFileId: Long?,
+    )
 }
