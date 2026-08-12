@@ -48,8 +48,9 @@ jobs:
               collector-upload-key.p12
             echo 'signing_key_source=created_once' >> "$GITHUB_ENV"
           fi
+          KEY_RELEASE_ID="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/collector-signing-key" --jq .id)"
           gh api --method PATCH \
-            "repos/${GITHUB_REPOSITORY}/releases/tags/collector-signing-key" \
+            "repos/${GITHUB_REPOSITORY}/releases/${KEY_RELEASE_ID}" \
             -F prerelease=true -f make_latest=false >/dev/null
       - name: Test and build exact source
         run: |
@@ -96,6 +97,7 @@ jobs:
               uma-collector-${{ steps.source.outputs.sha }}.apk \
               SHA256SUMS BUILD-MANIFEST.txt SIGNING-CERTIFICATE.txt SIGNING-IDENTITY.txt
           fi
+          APK_RELEASE_ID="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .id)"
           gh api --method PATCH \
-            "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+            "repos/${GITHUB_REPOSITORY}/releases/${APK_RELEASE_ID}" \
             -F prerelease=false -F draft=false -f make_latest=true >/dev/null
