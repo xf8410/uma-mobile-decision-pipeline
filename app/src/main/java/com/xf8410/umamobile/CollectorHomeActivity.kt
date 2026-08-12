@@ -5,8 +5,11 @@ import android.os.Bundle
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 
 class CollectorHomeActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -24,7 +27,15 @@ class CollectorHomeActivity : ComponentActivity() {
             addView(actionButton("验证最新本地 Session", VerifySessionActivity::class.java), matchWidth())
             addView(actionButton("重新读取 SO 索引并终验", RemoteVerificationActivity::class.java), matchWidth())
         }
-        setContentView(layout)
+        val root = ScrollView(this).apply {
+            addView(layout)
+            ViewCompat.setOnApplyWindowInsetsListener(this) { view, insets ->
+                val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+                view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+                insets
+            }
+        }
+        setContentView(root)
     }
 
     private fun actionButton(label: String, target: Class<*>) = Button(this).apply {
