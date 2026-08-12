@@ -28,7 +28,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         title = "Uma Collector"
-
         statusText = TextView(this).apply {
             text = "等待连接 http://127.0.0.1:18765"
             textSize = 14f
@@ -42,7 +41,7 @@ class MainActivity : ComponentActivity() {
             addView(operationButton("检查 SO 健康与状态") { checkHealth() }, matchWidth())
             addView(operationButton("按固定顺序开启 Hook") { enableHooks() }, matchWidth())
             addView(operationButton("读取 Session 与完整文件索引") { loadSessions() }, matchWidth())
-            addView(operationButton("同步最新 Session 原始文件") { syncLatestSession() }, matchWidth())
+            addView(operationButton("同步已选择的 Session 原始文件") { syncSelectedSession() }, matchWidth())
             addView(statusText, matchWidth())
         }
         setContentView(ScrollView(this).apply { addView(content) })
@@ -72,14 +71,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun enableHooks() = runOperation("正在执行固定 Hook 顺序……") {
-        val steps = listOf(
-            "/api/sniff/diag",
-            "/api/md5log/install",
-            "/api/md5log",
-            "/api/md5log/clear",
-            "/api/sniff/toggle?enabled=1",
-            "/api/sniff/diag",
-        )
+        val steps = listOf("/api/sniff/diag", "/api/md5log/install", "/api/md5log", "/api/md5log/clear", "/api/sniff/toggle?enabled=1", "/api/sniff/diag")
         val responses = steps.map { path -> getText(path).also { requireSuccess(path, it) } }
         val diagnostic = JSONObject(responses.last().body)
         val required = linkedMapOf(
@@ -96,8 +88,7 @@ class MainActivity : ComponentActivity() {
                 appendLine(response.body)
             }
             required.forEach { (name, value) -> appendLine("$name=$value") }
-            if (failed.isEmpty()) append("Hook 最终诊断通过")
-            else append("Hook 最终诊断未通过：${failed.joinToString()}")
+            if (failed.isEmpty()) append("Hook 最终诊断通过") else append("Hook 最终诊断未通过：${failed.joinToString()}")
         }
     }
 
@@ -122,32 +113,31 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun syncLatestSession() = runOperation("正在同步最新 Session，可中断后继续……") {
+    private fun syncSelectedSession() = runOperation("正在同步已选择的 Session，可中断后继续……") {
+        val selectedId = getSharedPreferences(SessionSelectionActivity.PREFERENCES, MODE_PRIVATE)
+            .getString(SessionSelectionActivity.KEY_SELECTED_SESSION, null)
+            ?.takeIf { it.isNotBlank() }
+            ?: throw IllegalStateException("尚未选择历史 Session，请先返回首页选择")
         val sessions = fetchSessions()
-        if (sessions.length() == 0) throw IllegalStateException("SO 没有 Session")
-        var latest = sessions.getJSONObject(0)
-        for (index in 1 until sessions.length()) {
-            val candidate = sessions.getJSONObject(index)
-            if (candidate.optLong("started_at_ms", Long.MIN_VALUE) > latest.optLong("started_at_ms", Long.MIN_VALUE)) {
-                latest = candidate
-            }
-        }
-        val sessionId = latest.getString("session_id")
-        val files = loadAllFiles(sessionId)
-        val sessionRoot = File(filesDir, "sessions/$sessionId").apply { mkdirs() }
+        val selected = (0 until sessions.length())
+            .map { sessions.getJSONObject(it) }
+            .firstOrNull { it.optString("session_id") == selectedId }
+            ?: throw IllegalStateException("已选择的 Session 不再存在：$selectedId，请重新选择")
+        val state = selected.optString("state", "unknown")
+        val files = loadAllFiles(selectedId)
+        val sessionRoot = File(filesDir, "sessions/$selectedId").apply { mkdirs() }
         val rawRoot = File(sessionRoot, "raw").apply { mkdirs() }
         val records = JSONArray()
         var downloaded = 0
         var resumed = 0
         var reused = 0
         var totalBytes = 0L
-
         for (record in files) {
             val result = syncFile(rawRoot, record)
             when (result.mode) {
-                "downloaded" -> downloaded += 1
-                "resumed" -> resumed += 1
-                "verified_existing" -> reused += 1
+                "downloaded" -> downloaded++
+                "resumed" -> resumed++
+                "verified_existing" -> reused++
             }
             totalBytes = Math.addExact(totalBytes, record.byteLength)
             records.put(JSONObject().apply {
@@ -161,10 +151,10 @@ class MainActivity : ComponentActivity() {
                 put("sync_mode", result.mode)
             })
         }
-
         val manifest = JSONObject().apply {
             put("schema_version", 1)
-            put("session_id", sessionId)
+            put("session_id", selectedId)
+            put("session_state", state)
             put("source", "http://127.0.0.1:18765")
             put("file_count", files.size)
             put("total_bytes", totalBytes)
@@ -174,7 +164,8 @@ class MainActivity : ComponentActivity() {
             put("files", records)
         }
         atomicWrite(File(sessionRoot, "manifest.json"), manifest.toString(2).toByteArray(Charsets.UTF_8))
-        "同步完成\nsession_id=$sessionId\nfiles=${files.size}\nbytes=$totalBytes\ndownloaded=$downloaded\nresumed=$resumed\nverified_existing=$reused\nmanifest=${File(sessionRoot, "manifest.json").absolutePath}"
+        val mode = if (state == "open") "增量快照（open Session 仍可能继续写入）" else "完整同步与终验（Session 已停止写入）"
+        "同步完成\nsession_id=$selectedId\nstate=$state\n模式=$mode\nfiles=${files.size}\nbytes=$totalBytes\ndownloaded=$downloaded\nresumed=$resumed\nverified_existing=$reused\nmanifest=${File(sessionRoot, "manifest.json").absolutePath}"
     }
 
     private fun fetchSessions(): JSONArray {
@@ -201,14 +192,7 @@ class MainActivity : ComponentActivity() {
                 val file = files.getJSONObject(index)
                 val length = file.getLong("byte_length")
                 if (length < 0L) throw IllegalStateException("negative byte_length")
-                result += RemoteFile(
-                    fileId = file.getLong("file_id"),
-                    relativePath = file.getString("relative_path"),
-                    contentType = file.getString("content_type"),
-                    byteLength = length,
-                    sha256 = file.optString("sha256").takeIf { file.has("sha256") && !file.isNull("sha256") && it.isNotEmpty() },
-                    createdAtMs = file.getLong("created_at_ms"),
-                )
+                result += RemoteFile(file.getLong("file_id"), file.getString("relative_path"), file.getString("content_type"), length, file.optString("sha256").takeIf { file.has("sha256") && !file.isNull("sha256") && it.isNotEmpty() }, file.getLong("created_at_ms"))
             }
             val nextCursor = root.getLong("next_cursor")
             if (files.length() == 0 || files.length() < 1000) break
@@ -220,49 +204,31 @@ class MainActivity : ComponentActivity() {
 
     private fun syncFile(rawRoot: File, record: RemoteFile): SyncResult {
         val relative = java.nio.file.Paths.get(record.relativePath)
-        if (relative.isAbsolute || relative.normalize().startsWith("..")) {
-            throw IllegalStateException("invalid relative_path=${record.relativePath}")
-        }
+        if (relative.isAbsolute || relative.normalize().startsWith("..")) throw IllegalStateException("invalid relative_path=${record.relativePath}")
         val target = File(rawRoot, record.relativePath)
         val rootPath = rawRoot.canonicalFile.toPath()
         val targetPath = target.canonicalFile.toPath()
         if (!targetPath.startsWith(rootPath)) throw IllegalStateException("path escaped raw root")
         target.parentFile?.mkdirs()
-
         if (target.isFile && target.length() == record.byteLength) {
             val hash = sha256(target)
-            if (record.sha256 == null || hash.equals(record.sha256, ignoreCase = true)) {
-                return SyncResult("verified_existing", hash)
-            }
+            if (record.sha256 == null || hash.equals(record.sha256, ignoreCase = true)) return SyncResult("verified_existing", hash)
         }
-
         val part = File(target.parentFile, target.name + ".part")
         if (part.length() > record.byteLength) part.delete()
         var offset = part.length()
         val initialOffset = offset
-        if (record.byteLength == 0L) {
-            FileOutputStream(part, false).use { it.fd.sync() }
-        } else {
-            while (offset < record.byteLength) {
-                val requested = minOf(RANGE_CHUNK_BYTES, record.byteLength - offset)
-                val range = getRange(record.fileId, offset, requested)
-                if (range.fileLength != record.byteLength || range.start != offset || range.endExclusive != offset + range.bytes.size) {
-                    throw IllegalStateException("range metadata mismatch for file_id=${record.fileId}")
-                }
-                if (range.bytes.isEmpty()) throw IllegalStateException("empty range before EOF for file_id=${record.fileId}")
-                FileOutputStream(part, true).use { output ->
-                    output.write(range.bytes)
-                    output.flush()
-                    output.fd.sync()
-                }
-                offset += range.bytes.size
-            }
+        if (record.byteLength == 0L) FileOutputStream(part, false).use { it.fd.sync() } else while (offset < record.byteLength) {
+            val requested = minOf(RANGE_CHUNK_BYTES, record.byteLength - offset)
+            val range = getRange(record.fileId, offset, requested)
+            if (range.fileLength != record.byteLength || range.start != offset || range.endExclusive != offset + range.bytes.size) throw IllegalStateException("range metadata mismatch for file_id=${record.fileId}")
+            if (range.bytes.isEmpty()) throw IllegalStateException("empty range before EOF for file_id=${record.fileId}")
+            FileOutputStream(part, true).use { output -> output.write(range.bytes); output.flush(); output.fd.sync() }
+            offset += range.bytes.size
         }
         if (part.length() != record.byteLength) throw IllegalStateException("local length mismatch for file_id=${record.fileId}")
         val hash = sha256(part)
-        if (record.sha256 != null && !hash.equals(record.sha256, ignoreCase = true)) {
-            throw IllegalStateException("SHA-256 mismatch for file_id=${record.fileId}")
-        }
+        if (record.sha256 != null && !hash.equals(record.sha256, ignoreCase = true)) throw IllegalStateException("SHA-256 mismatch for file_id=${record.fileId}")
         moveAtomically(part, target)
         return SyncResult(if (initialOffset > 0L) "resumed" else "downloaded", hash)
     }
@@ -272,128 +238,53 @@ class MainActivity : ComponentActivity() {
         val connection = open(path)
         return try {
             val code = connection.responseCode
-            if (code != 206 && !(code == 200 && length == 0L)) {
-                val error = connection.errorStream?.readBytes()?.toString(Charsets.UTF_8).orEmpty()
-                throw IllegalStateException("GET $path → HTTP $code\n$error")
-            }
+            if (code != 206 && !(code == 200 && length == 0L)) throw IllegalStateException("GET $path → HTTP $code")
             val bytes = connection.inputStream.use { it.readBytes() }
             val fileLength = requiredHeaderLong(connection, "X-HLPATCH-File-Length")
             val start = requiredHeaderLong(connection, "X-HLPATCH-Range-Start")
             val end = requiredHeaderLong(connection, "X-HLPATCH-Range-End-Exclusive")
             if (bytes.size.toLong() != connection.contentLengthLong) throw IllegalStateException("HTTP Content-Length mismatch")
             RangeResult(bytes, fileLength, start, end)
-        } finally {
-            connection.disconnect()
-        }
+        } finally { connection.disconnect() }
     }
 
-    private fun requiredHeaderLong(connection: HttpURLConnection, name: String): Long =
-        connection.getHeaderField(name)?.toLongOrNull() ?: throw IllegalStateException("missing or invalid $name")
-
+    private fun requiredHeaderLong(connection: HttpURLConnection, name: String) = connection.getHeaderField(name)?.toLongOrNull() ?: throw IllegalStateException("missing or invalid $name")
     private fun atomicWrite(target: File, bytes: ByteArray) {
         target.parentFile?.mkdirs()
         val part = File(target.parentFile, target.name + ".part")
-        FileOutputStream(part, false).use { output ->
-            output.write(bytes)
-            output.flush()
-            output.fd.sync()
-        }
+        FileOutputStream(part, false).use { it.write(bytes); it.flush(); it.fd.sync() }
         moveAtomically(part, target)
     }
-
-    private fun moveAtomically(source: File, target: File) {
-        try {
-            Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-        } catch (_: Exception) {
-            Files.move(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
-        }
-    }
-
+    private fun moveAtomically(source: File, target: File) { try { Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING) } catch (_: Exception) { Files.move(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING) } }
     private fun sha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().buffered().use { input ->
             val buffer = ByteArray(64 * 1024)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                digest.update(buffer, 0, count)
-            }
+            while (true) { val count = input.read(buffer); if (count < 0) break; digest.update(buffer, 0, count) }
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
-
-    private fun requireSuccess(path: String, response: HttpResult) {
-        if (response.code !in 200..299) throw IllegalStateException("GET $path → HTTP ${response.code}\n${response.body}")
-    }
-
+    private fun requireSuccess(path: String, response: HttpResult) { if (response.code !in 200..299) throw IllegalStateException("GET $path → HTTP ${response.code}\n${response.body}") }
     private fun runOperation(progress: String, operation: () -> String) {
         setBusy(true, progress)
-        executor.execute {
-            val result = runCatching(operation).fold(
-                onSuccess = { it },
-                onFailure = { error -> "操作失败\n${error.javaClass.simpleName}: ${error.message.orEmpty()}" },
-            )
-            runOnUiThread { setBusy(false, result) }
-        }
+        executor.execute { val result = runCatching(operation).fold({ it }, { error -> "操作失败\n${error.javaClass.simpleName}: ${error.message.orEmpty()}" }); runOnUiThread { setBusy(false, result) } }
     }
-
-    private fun setBusy(busy: Boolean, message: String) {
-        operationButtons.forEach { it.isEnabled = !busy }
-        statusText.text = message
-    }
-
-    private fun open(path: String): HttpURLConnection =
-        (URL("http://127.0.0.1:18765$path").openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 5_000
-            readTimeout = 30_000
-            useCaches = false
-        }
-
-    private fun getText(path: String): HttpResult {
-        val connection = open(path)
-        return try {
-            val code = connection.responseCode
-            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-            HttpResult(code, stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty())
-        } finally {
-            connection.disconnect()
-        }
-    }
-
+    private fun setBusy(busy: Boolean, message: String) { operationButtons.forEach { it.isEnabled = !busy }; statusText.text = message }
+    private fun open(path: String) = (URL("http://127.0.0.1:18765$path").openConnection() as HttpURLConnection).apply { requestMethod = "GET"; connectTimeout = 5_000; readTimeout = 30_000; useCaches = false }
+    private fun getText(path: String): HttpResult { val connection = open(path); return try { val code = connection.responseCode; val stream = if (code in 200..299) connection.inputStream else connection.errorStream; HttpResult(code, stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()) } finally { connection.disconnect() } }
     private fun findBoolean(root: Any?, vararg path: String): Boolean? {
         if (path.isEmpty()) return root as? Boolean
-        val key = path.first()
-        val remaining = path.drop(1).toTypedArray()
+        val key = path.first(); val remaining = path.drop(1).toTypedArray()
         when (root) {
-            is JSONObject -> {
-                if (root.has(key)) findBoolean(root.opt(key), *remaining)?.let { return it }
-                val keys = root.keys()
-                while (keys.hasNext()) findBoolean(root.opt(keys.next()), *path)?.let { return it }
-            }
+            is JSONObject -> { if (root.has(key)) findBoolean(root.opt(key), *remaining)?.let { return it }; val keys = root.keys(); while (keys.hasNext()) findBoolean(root.opt(keys.next()), *path)?.let { return it } }
             is JSONArray -> for (index in 0 until root.length()) findBoolean(root.opt(index), *path)?.let { return it }
         }
         return null
     }
-
-    override fun onDestroy() {
-        executor.shutdownNow()
-        super.onDestroy()
-    }
-
+    override fun onDestroy() { executor.shutdownNow(); super.onDestroy() }
     private data class HttpResult(val code: Int, val body: String)
-    private data class RemoteFile(
-        val fileId: Long,
-        val relativePath: String,
-        val contentType: String,
-        val byteLength: Long,
-        val sha256: String?,
-        val createdAtMs: Long,
-    )
+    private data class RemoteFile(val fileId: Long, val relativePath: String, val contentType: String, val byteLength: Long, val sha256: String?, val createdAtMs: Long)
     private data class RangeResult(val bytes: ByteArray, val fileLength: Long, val start: Long, val endExclusive: Long)
     private data class SyncResult(val mode: String, val sha256: String)
-
-    companion object {
-        private const val RANGE_CHUNK_BYTES = 1024L * 1024L
-    }
+    companion object { private const val RANGE_CHUNK_BYTES = 1024L * 1024L }
 }
