@@ -21,6 +21,7 @@ import java.util.concurrent.Executors
 class DecodedResultsActivity : ComponentActivity() {
     private val executor = Executors.newSingleThreadExecutor()
     private val derivationCore = TrainingStateDerivationCore()
+    private val orderingModel = SessionRecordOrderingModel()
     private lateinit var content: LinearLayout
     private lateinit var status: TextView
 
@@ -73,10 +74,12 @@ class DecodedResultsActivity : ComponentActivity() {
 
     private fun derive(sessionId: String): String {
         derivationCore.verifySyntheticFixture()
+        orderingModel.verifySyntheticFixture()
         val root = File(filesDir, "sessions/$sessionId")
         val filesRoot = File(root, "decoded/files")
         if (!filesRoot.isDirectory) throw IllegalStateException("缺少 decoded/files/，请先执行解码")
-        val output = JSONArray()
+        val metadataByRawPath = readOrderingMetadata(root)
+        val candidates = ArrayList<SortableTrainingState>()
         val errors = JSONArray()
         var inspected = 0
         var matched = 0
@@ -91,16 +94,20 @@ class DecodedResultsActivity : ComponentActivity() {
                 val sourceRaw = metaValue(meta, "source_raw")
                 val sourceRawSha256 = metaValue(meta, "sha256")
                 matched++
-                output.put(
-                    derivationCore.deriveState(
-                        sessionId = sessionId,
-                        derivationIndex = matched,
-                        sourceFile = relative,
-                        sourceDecodedSha256 = sha256(file),
-                        sourceRaw = sourceRaw,
-                        sourceRawSha256 = sourceRawSha256,
-                        located = located,
-                    ),
+                val state = derivationCore.deriveState(
+                    sessionId = sessionId,
+                    derivationIndex = matched,
+                    sourceFile = relative,
+                    sourceDecodedSha256 = sha256(file),
+                    sourceRaw = sourceRaw,
+                    sourceRawSha256 = sourceRawSha256,
+                    located = located,
+                )
+                val rawPath = (sourceRaw as? String)?.replace('\\', '/')
+                candidates += SortableTrainingState(
+                    originalTraversalIndex = matched,
+                    state = state,
+                    metadata = rawPath?.let { metadataByRawPath[it] },
                 )
             } catch (error: Exception) {
                 errors.put(JSONObject().apply {
@@ -113,6 +120,8 @@ class DecodedResultsActivity : ComponentActivity() {
                 })
             }
         }
+        val ordered = orderingModel.order(candidates)
+        val output = JSONArray().apply { ordered.records.forEach { put(it.state) } }
         val derived = File(root, "derived")
         atomicWrite(File(derived, "training-state.jsonl"), lines(output))
         atomicWrite(File(derived, "training-state-errors.json"), errors.toString().toByteArray(Charsets.UTF_8))
@@ -128,11 +137,32 @@ class DecodedResultsActivity : ComponentActivity() {
             put("states_emitted", matched)
             put("errors", errors.length())
             put("selection_gate", "one object directly contains chara_info and at least one *_data_set")
-            put("ordering_policy", "derivation_index records traversal only and is not asserted as protocol sequence")
+            put("ordering_basis", ordered.basis.serialized)
+            put("ordering_policy", ordered.policy)
             put("field_policy", "awaiting_real_session_validation semantic mappings; missing values remain null; every emitted value links to decoded and raw evidence")
             put("synthetic_validation", "passed; test-only and not evidence of game semantics")
         }.toString().toByteArray(Charsets.UTF_8))
-        return "TrainingState 证据生成完成\nsession_id=$sessionId\nfiles_inspected=$inspected\nstates_emitted=$matched\nerrors=${errors.length()}\nmapping_version=${derivationCore.mappingVersion}\nderived/training-state.jsonl\nderived/field-mapping.v${derivationCore.mappingVersion}.json\nderived/training-state-manifest.json\nderived/training-state-errors.json"
+        return "TrainingState 证据生成完成\nsession_id=$sessionId\nfiles_inspected=$inspected\nstates_emitted=$matched\nerrors=${errors.length()}\nordering_basis=${ordered.basis.serialized}\nmapping_version=${derivationCore.mappingVersion}\nderived/training-state.jsonl\nderived/field-mapping.v${derivationCore.mappingVersion}.json\nderived/training-state-manifest.json\nderived/training-state-errors.json"
+    }
+
+    private fun readOrderingMetadata(sessionRoot: File): Map<String, ConfirmedOrderingMetadata> {
+        val manifestFile = File(sessionRoot, "manifest.json")
+        if (!manifestFile.isFile) return emptyMap()
+        val manifest = JSONTokener(manifestFile.readText(Charsets.UTF_8)).nextValue() as? JSONObject ?: return emptyMap()
+        val files = manifest.optJSONArray("files") ?: return emptyMap()
+        val result = LinkedHashMap<String, ConfirmedOrderingMetadata>()
+        for (index in 0 until files.length()) {
+            val record = files.optJSONObject(index) ?: continue
+            if (!record.has("relative_path") || record.isNull("relative_path") || !record.has("created_at_ms") || record.isNull("created_at_ms")) continue
+            val relativePath = record.optString("relative_path").replace('\\', '/').trimStart('/')
+            val createdAt = runCatching { record.getLong("created_at_ms") }.getOrNull() ?: continue
+            result["raw/$relativePath"] = ConfirmedOrderingMetadata(
+                observedAtMs = createdAt,
+                evidenceFile = "manifest.json",
+                evidencePath = "files[$index].created_at_ms",
+            )
+        }
+        return result
     }
 
     private fun metaValue(meta: JSONObject?, key: String): Any =
@@ -214,6 +244,85 @@ internal enum class MappingStatus(val serialized: String) {
     AWAITING_REAL_SESSION_VALIDATION("awaiting_real_session_validation"),
 }
 
+internal enum class OrderingBasis(val serialized: String) {
+    SOURCE_CREATED_AT_MS("source_created_at_ms"),
+    SOURCE_CREATED_AT_MS_WITH_UNKNOWN_TIES("source_created_at_ms_with_unknown_ties"),
+    UNKNOWN_ORIGINAL_TRAVERSAL("unknown_original_traversal"),
+}
+
+internal data class ConfirmedOrderingMetadata(
+    val observedAtMs: Long,
+    val evidenceFile: String,
+    val evidencePath: String,
+)
+
+internal data class SortableTrainingState(
+    val originalTraversalIndex: Int,
+    val state: JSONObject,
+    val metadata: ConfirmedOrderingMetadata?,
+)
+
+internal data class OrderedTrainingStates(
+    val records: List<SortableTrainingState>,
+    val basis: OrderingBasis,
+    val policy: String,
+)
+
+/** Uses only explicit Session index timestamps; filenames are never interpreted as protocol order. */
+internal class SessionRecordOrderingModel {
+    fun order(input: List<SortableTrainingState>): OrderedTrainingStates {
+        val allHaveTime = input.isNotEmpty() && input.all { it.metadata != null }
+        val ordered: List<SortableTrainingState>
+        val basis: OrderingBasis
+        val policy: String
+        if (!allHaveTime) {
+            ordered = input.sortedBy { it.originalTraversalIndex }
+            basis = OrderingBasis.UNKNOWN_ORIGINAL_TRAVERSAL
+            policy = "at least one record lacks confirmed ordering metadata; preserve original decoded-file traversal; do not infer order from filenames"
+        } else {
+            ordered = input.sortedWith(compareBy<SortableTrainingState> { it.metadata!!.observedAtMs }.thenBy { it.originalTraversalIndex })
+            val duplicates = ordered.groupBy { it.metadata!!.observedAtMs }.values.any { it.size > 1 }
+            basis = if (duplicates) OrderingBasis.SOURCE_CREATED_AT_MS_WITH_UNKNOWN_TIES else OrderingBasis.SOURCE_CREATED_AT_MS
+            policy = if (duplicates) {
+                "sort by manifest files[].created_at_ms; equal timestamps preserve original traversal and remain an unknown tie, without filename inference"
+            } else {
+                "sort by manifest files[].created_at_ms; do not infer order from filenames"
+            }
+        }
+        ordered.forEachIndexed { index, record -> annotate(record, index + 1, basis) }
+        return OrderedTrainingStates(ordered, basis, policy)
+    }
+
+    private fun annotate(record: SortableTrainingState, order: Int, basis: OrderingBasis) {
+        record.state.put("record_order", order)
+        record.state.put("ordering_basis", basis.serialized)
+        record.state.put("ordering_status", if (basis == OrderingBasis.UNKNOWN_ORIGINAL_TRAVERSAL) MappingStatus.UNKNOWN.serialized else MappingStatus.CONFIRMED.serialized)
+        val metadata = record.metadata
+        record.state.put("ordering_evidence", if (metadata == null || basis == OrderingBasis.UNKNOWN_ORIGINAL_TRAVERSAL) JSONObject.NULL else JSONObject().apply {
+            put("source_file", metadata.evidenceFile)
+            put("source_path", metadata.evidencePath)
+            put("observed_at_ms", metadata.observedAtMs)
+        })
+        record.state.put("ordering_tie_basis", if (basis == OrderingBasis.SOURCE_CREATED_AT_MS_WITH_UNKNOWN_TIES) OrderingBasis.UNKNOWN_ORIGINAL_TRAVERSAL.serialized else JSONObject.NULL)
+    }
+
+    /** Synthetic/test-only checks prove ordering behavior, not actual game protocol order. */
+    fun verifySyntheticFixture() {
+        fun record(id: String, traversal: Int, time: Long?) = SortableTrainingState(
+            traversal,
+            JSONObject().put("fixture_id", id),
+            time?.let { ConfirmedOrderingMetadata(it, "synthetic/test-only-manifest.json", "files[$traversal].created_at_ms") },
+        )
+        val sorted = order(listOf(record("late", 1, 20), record("tie-a", 2, 10), record("tie-b", 3, 10)))
+        check(sorted.records.map { it.state.getString("fixture_id") } == listOf("tie-a", "tie-b", "late"))
+        check(sorted.basis == OrderingBasis.SOURCE_CREATED_AT_MS_WITH_UNKNOWN_TIES)
+        val unknown = order(listOf(record("first", 1, 20), record("second", 2, null)))
+        check(unknown.records.map { it.state.getString("fixture_id") } == listOf("first", "second"))
+        check(unknown.basis == OrderingBasis.UNKNOWN_ORIGINAL_TRAVERSAL)
+        check(unknown.records.all { it.state.isNull("ordering_evidence") })
+    }
+}
+
 internal data class LocatedTrainingData(val value: JSONObject, val evidencePath: String)
 
 internal data class TrainingFieldMapping(
@@ -222,10 +331,7 @@ internal data class TrainingFieldMapping(
     val status: MappingStatus = MappingStatus.AWAITING_REAL_SESSION_VALIDATION,
 )
 
-/**
- * Android-independent derivation rules. File traversal, UI and persistence remain outside this component,
- * so the same input JSON can be replayed deterministically in local JVM tests or on device.
- */
+/** Android-independent and deterministically replayable TrainingState derivation rules. */
 internal class TrainingStateDerivationCore {
     val schemaVersion: Int = 3
     val mappingVersion: Int = 2
@@ -251,40 +357,22 @@ internal class TrainingStateDerivationCore {
         when (value) {
             is JSONObject -> {
                 val keys = objectKeys(value)
-                if (value.opt("chara_info") is JSONObject && keys.any { it.endsWith("_data_set") }) {
-                    return LocatedTrainingData(value, evidencePath)
-                }
+                if (value.opt("chara_info") is JSONObject && keys.any { it.endsWith("_data_set") }) return LocatedTrainingData(value, evidencePath)
                 keys.forEach { key -> locateTrainingData(value.opt(key), "$evidencePath.$key")?.let { return it } }
             }
-            is JSONArray -> for (index in 0 until value.length()) {
-                locateTrainingData(value.opt(index), "$evidencePath[$index]")?.let { return it }
-            }
+            is JSONArray -> for (index in 0 until value.length()) locateTrainingData(value.opt(index), "$evidencePath[$index]")?.let { return it }
         }
         return null
     }
 
-    fun deriveState(
-        sessionId: String,
-        derivationIndex: Int,
-        sourceFile: String,
-        sourceDecodedSha256: String,
-        sourceRaw: Any,
-        sourceRawSha256: Any,
-        located: LocatedTrainingData,
-    ): JSONObject {
-        val chara = located.value.optJSONObject("chara_info")
-            ?: throw IllegalArgumentException("located object no longer contains chara_info")
+    fun deriveState(sessionId: String, derivationIndex: Int, sourceFile: String, sourceDecodedSha256: String, sourceRaw: Any, sourceRawSha256: Any, located: LocatedTrainingData): JSONObject {
+        val chara = located.value.optJSONObject("chara_info") ?: throw IllegalArgumentException("located object no longer contains chara_info")
         val dataSetKeys = objectKeys(located.value).filter { it.endsWith("_data_set") }
         if (dataSetKeys.isEmpty()) throw IllegalArgumentException("located object no longer contains *_data_set")
         return JSONObject().apply {
-            put("schema_version", schemaVersion)
-            put("mapping_version", mappingVersion)
-            put("session_id", sessionId)
-            put("derivation_index", derivationIndex)
-            put("source_file", sourceFile)
-            put("source_file_sha256", sourceDecodedSha256)
-            put("source_raw", sourceRaw)
-            put("source_raw_sha256", sourceRawSha256)
+            put("schema_version", schemaVersion); put("mapping_version", mappingVersion); put("session_id", sessionId)
+            put("derivation_index", derivationIndex); put("source_file", sourceFile); put("source_file_sha256", sourceDecodedSha256)
+            put("source_raw", sourceRaw); put("source_raw_sha256", sourceRawSha256)
             fieldMappings.forEach { mapping -> put(mapping.target, mappedValue(chara, mapping)) }
             put("training_data_sets", stringArray(dataSetKeys))
             put("event_data", if (located.value.has("unchecked_event_array")) located.value.opt("unchecked_event_array") else JSONObject.NULL)
@@ -294,18 +382,13 @@ internal class TrainingStateDerivationCore {
     }
 
     fun fieldMappingDocument(): JSONObject = JSONObject().apply {
-        put("schema_version", 1)
-        put("mapping_version", mappingVersion)
+        put("schema_version", 1); put("mapping_version", mappingVersion)
         put("allowed_mapping_statuses", stringArray(MappingStatus.values().map { it.serialized }))
         put("status_policy", "field-name semantic mappings remain awaiting_real_session_validation until supported by real replay evidence")
-        put("mappings", JSONArray().apply {
-            fieldMappings.forEach { mapping -> put(JSONObject().apply {
-                put("source_paths", stringArray(mapping.sourceKeys.map { "data.chara_info.$it" }))
-                put("target", mapping.target)
-                put("mapping_status", mapping.status.serialized)
-                put("value_policy", "first present non-null source key; otherwise null")
-            }) }
-        })
+        put("mappings", JSONArray().apply { fieldMappings.forEach { mapping -> put(JSONObject().apply {
+            put("source_paths", stringArray(mapping.sourceKeys.map { "data.chara_info.$it" })); put("target", mapping.target)
+            put("mapping_status", mapping.status.serialized); put("value_policy", "first present non-null source key; otherwise null")
+        }) } })
     }
 
     /** Repeatable synthetic/test-only invariant check; it does not confirm any game field semantics. */
@@ -314,74 +397,42 @@ internal class TrainingStateDerivationCore {
         val source = JSONObject().apply {
             put("unknown_fixture_field", JSONObject().put("kept", true))
             put("chara_info", JSONObject().apply { put("speed", 0); put("vital", JSONObject.NULL) })
-            put("synthetic_data_set", JSONArray().put(2).put(1).put(1))
-            put("unchecked_event_array", duplicateEvents)
+            put("synthetic_data_set", JSONArray().put(2).put(1).put(1)); put("unchecked_event_array", duplicateEvents)
         }
         val located = locateTrainingData(source) ?: error("synthetic fixture was not located")
         val state = deriveState("synthetic-test-only", 1, "decoded/synthetic.json", "decoded-sha", "raw/synthetic", "raw-sha", located)
-        check(state.getInt("speed") == 0)
-        check(state.isNull("vital"))
-        check(state.getJSONArray("event_data").toString() == duplicateEvents.toString())
-        check(located.value.getJSONObject("unknown_fixture_field").getBoolean("kept"))
-        check(state.getJSONArray("training_data_sets").getString(0) == "synthetic_data_set")
+        check(state.getInt("speed") == 0); check(state.isNull("vital")); check(state.getJSONArray("event_data").toString() == duplicateEvents.toString())
+        check(located.value.getJSONObject("unknown_fixture_field").getBoolean("kept")); check(state.getJSONArray("training_data_sets").getString(0) == "synthetic_data_set")
         check(state.getString("mapping_status") == MappingStatus.AWAITING_REAL_SESSION_VALIDATION.serialized)
     }
 
-    private fun evidenceRefs(
-        decodedFile: String,
-        decodedSha256: String,
-        sourceRaw: Any,
-        sourceRawSha256: Any,
-        located: LocatedTrainingData,
-        chara: JSONObject,
-        dataSetKeys: List<String>,
-    ): JSONArray = JSONArray().apply {
+    private fun evidenceRefs(decodedFile: String, decodedSha256: String, sourceRaw: Any, sourceRawSha256: Any, located: LocatedTrainingData, chara: JSONObject, dataSetKeys: List<String>): JSONArray = JSONArray().apply {
         fieldMappings.forEach { mapping ->
             val key = mapping.sourceKeys.firstOrNull { chara.has(it) && !chara.isNull(it) }
             put(JSONObject().apply {
-                put("target", mapping.target)
-                put("mapping_version", mappingVersion)
-                put("mapping_status", mapping.status.serialized)
-                put("source_decoded", decodedFile)
-                put("source_decoded_sha256", decodedSha256)
-                put("source_raw", sourceRaw)
-                put("source_raw_sha256", sourceRawSha256)
-                put("source_path", if (key == null) JSONObject.NULL else "${located.evidencePath}.chara_info.$key")
-                put("source_present", key != null)
+                put("target", mapping.target); put("mapping_version", mappingVersion); put("mapping_status", mapping.status.serialized)
+                put("source_decoded", decodedFile); put("source_decoded_sha256", decodedSha256); put("source_raw", sourceRaw); put("source_raw_sha256", sourceRawSha256)
+                put("source_path", if (key == null) JSONObject.NULL else "${located.evidencePath}.chara_info.$key"); put("source_present", key != null)
             })
         }
         dataSetKeys.forEach { key -> put(JSONObject().apply {
-            put("target", "training_data_sets")
-            put("mapping_status", MappingStatus.CONFIRMED.serialized)
-            put("source_decoded", decodedFile)
-            put("source_decoded_sha256", decodedSha256)
-            put("source_raw", sourceRaw)
-            put("source_raw_sha256", sourceRawSha256)
-            put("source_path", "${located.evidencePath}.$key")
+            put("target", "training_data_sets"); put("mapping_status", MappingStatus.CONFIRMED.serialized); put("source_decoded", decodedFile)
+            put("source_decoded_sha256", decodedSha256); put("source_raw", sourceRaw); put("source_raw_sha256", sourceRawSha256); put("source_path", "${located.evidencePath}.$key")
         }) }
         if (located.value.has("unchecked_event_array")) put(JSONObject().apply {
-            put("target", "event_data")
-            put("mapping_status", MappingStatus.CONFIRMED.serialized)
-            put("source_decoded", decodedFile)
-            put("source_decoded_sha256", decodedSha256)
-            put("source_raw", sourceRaw)
-            put("source_raw_sha256", sourceRawSha256)
+            put("target", "event_data"); put("mapping_status", MappingStatus.CONFIRMED.serialized); put("source_decoded", decodedFile)
+            put("source_decoded_sha256", decodedSha256); put("source_raw", sourceRaw); put("source_raw_sha256", sourceRawSha256)
             put("source_path", "${located.evidencePath}.unchecked_event_array")
         })
     }
 
     private fun mappedValue(chara: JSONObject, mapping: TrainingFieldMapping): Any {
-        mapping.sourceKeys.forEach { key ->
-            if (chara.has(key) && !chara.isNull(key)) return chara.opt(key) ?: JSONObject.NULL
-        }
+        mapping.sourceKeys.forEach { key -> if (chara.has(key) && !chara.isNull(key)) return chara.opt(key) ?: JSONObject.NULL }
         return JSONObject.NULL
     }
 
     private fun objectKeys(value: JSONObject): List<String> {
-        val result = ArrayList<String>()
-        val keys = value.keys()
-        while (keys.hasNext()) result += keys.next()
-        return result
+        val result = ArrayList<String>(); val keys = value.keys(); while (keys.hasNext()) result += keys.next(); return result
     }
 
     private fun stringArray(values: List<String>): JSONArray = JSONArray().apply { values.forEach { put(it) } }
