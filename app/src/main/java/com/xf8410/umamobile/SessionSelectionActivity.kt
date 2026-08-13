@@ -1,6 +1,5 @@
 package com.xf8410.umamobile
 
-import android.graphics.Typeface
 import android.os.Bundle
 import android.view.ViewGroup
 import android.widget.Button
@@ -8,16 +7,11 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
-import org.json.JSONArray
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
-import java.util.concurrent.Executors
+import java.io.File
 
 class SessionSelectionActivity : ComponentActivity() {
-    private val executor = Executors.newSingleThreadExecutor()
     private lateinit var list: LinearLayout
-    private lateinit var status: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -25,112 +19,89 @@ class SessionSelectionActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 24, 24, 48)
         }
-        status = TextView(this).apply {
-            text = "正在读取 SO 历史 Session……"
-            textSize = 14f
-            typeface = Typeface.MONOSPACE
-            setTextIsSelectable(true)
-            setPadding(16, 16, 16, 24)
-        }
-        list.addView(status, matchWidth())
         setContentView(ScrollView(this).apply { addView(list) })
-        loadSessions()
+        renderLocalSessions()
     }
 
-    private fun loadSessions() {
-        executor.execute {
-            val result = runCatching { fetchSessions() }
-            runOnUiThread {
-                result.onSuccess(::renderSessions).onFailure { error ->
-                    status.text = "读取失败\n${error.javaClass.simpleName}: ${error.message.orEmpty()}"
-                }
-            }
-        }
-    }
-
-    private fun renderSessions(sessions: JSONArray) {
+    private fun renderLocalSessions() {
         list.removeAllViews()
         val selected = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
             .getString(KEY_SELECTED_SESSION, null)
         list.addView(TextView(this).apply {
-            text = "选择要同步的历史 Session\n优先选择 interrupted；open 仍在增长，不能做最终一致性验收。"
+            text = "选择手机本地 Session\n该列表只读取 App 已下载的数据，不连接 SO。"
             textSize = 16f
             setPadding(16, 16, 16, 24)
         }, matchWidth())
 
-        val values = (0 until sessions.length())
-            .map { sessions.getJSONObject(it) }
-            .sortedWith(
-                compareBy<JSONObject> { it.optString("state") == "open" }
-                    .thenByDescending { it.optLong("started_at_ms") }
-            )
-        values.forEach { session ->
-            val id = session.getString("session_id")
-            val state = session.optString("state", "unknown")
+        val sessionsRoot = File(filesDir, "sessions")
+        val sessions = sessionsRoot.listFiles()
+            ?.filter { it.isDirectory }
+            ?.map { directory -> LocalSession(directory, readManifest(directory)) }
+            ?.sortedWith(compareByDescending<LocalSession> { it.startedAtMs }.thenByDescending { it.directory.lastModified() })
+            .orEmpty()
+
+        sessions.forEach { session ->
+            val id = session.directory.name
+            val state = session.state
             val marker = if (id == selected) "✓ 已选择\n" else ""
             list.addView(Button(this).apply {
                 isAllCaps = false
                 text = buildString {
                     append(marker)
-                    append("$id\n")
-                    append("state=$state  version=${session.optString("plugin_version", "unknown")}\n")
-                    append("started_at_ms=${session.optLong("started_at_ms")}")
+                    append(id)
+                    append('\n')
+                    append("state=$state")
+                    append("  files=${session.fileCount}")
+                    append("  bytes=${session.totalBytes}")
                 }
                 setOnClickListener {
                     getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
                         .putString(KEY_SELECTED_SESSION, id)
                         .putString(KEY_SELECTED_STATE, state)
                         .apply()
-                    statusMessage(id, state)
+                    android.app.AlertDialog.Builder(this@SessionSelectionActivity)
+                        .setTitle("已选择本地 Session")
+                        .setMessage(id)
+                        .setPositiveButton("确定") { _, _ -> renderLocalSessions() }
+                        .show()
                 }
             }, matchWidth())
         }
-        if (values.isEmpty()) {
-            list.addView(TextView(this).apply { text = "SO 没有 Session" }, matchWidth())
+
+        if (sessions.isEmpty()) {
+            list.addView(TextView(this).apply {
+                text = "手机本地没有已下载 Session\n请先在 SO 可连接时下载一个 Session。"
+                setPadding(16, 16, 16, 24)
+            }, matchWidth())
         }
     }
 
-    private fun statusMessage(id: String, state: String) {
-        val message = if (state == "open") {
-            "已选择 $id\n注意：该 Session 仍在写入，只适合增量同步。"
-        } else {
-            "已选择 $id\n该 Session 已停止写入，适合完整同步与终验。"
-        }
-        android.app.AlertDialog.Builder(this)
-            .setTitle("Session 已保存")
-            .setMessage(message)
-            .setPositiveButton("确定") { _, _ -> recreate() }
-            .show()
-    }
-
-    private fun fetchSessions(): JSONArray {
-        val path = "/storage/sessions"
-        val connection = URL("http://127.0.0.1:18765$path").openConnection() as HttpURLConnection
-        return try {
-            connection.requestMethod = "GET"
-            connection.connectTimeout = 5_000
-            connection.readTimeout = 30_000
-            connection.useCaches = false
-            val code = connection.responseCode
-            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-            val body = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
-            if (code !in 200..299) throw IllegalStateException("GET $path → HTTP $code\n$body")
-            val root = JSONObject(body)
-            if (!root.optBoolean("ok", false)) throw IllegalStateException(body)
-            root.optJSONArray("sessions") ?: JSONArray()
-        } finally {
-            connection.disconnect()
-        }
-    }
+    private fun readManifest(directory: File): JSONObject? = runCatching {
+        val file = File(directory, "manifest.json")
+        if (file.isFile) JSONObject(file.readText(Charsets.UTF_8)) else null
+    }.getOrNull()
 
     private fun matchWidth() = LinearLayout.LayoutParams(
         ViewGroup.LayoutParams.MATCH_PARENT,
         ViewGroup.LayoutParams.WRAP_CONTENT,
     )
 
-    override fun onDestroy() {
-        executor.shutdownNow()
-        super.onDestroy()
+    private data class LocalSession(
+        val directory: File,
+        val manifest: JSONObject?,
+    ) {
+        val state: String get() = manifest?.optString("session_state", "local")?.takeIf { it.isNotBlank() } ?: "local"
+        val startedAtMs: Long get() = manifest?.optLong("started_at_ms", directory.lastModified()) ?: directory.lastModified()
+        val fileCount: Int get() = manifest?.optInt("file_count", countRawFiles()) ?: countRawFiles()
+        val totalBytes: Long get() = manifest?.optLong("total_bytes", sumRawBytes()) ?: sumRawBytes()
+        private fun countRawFiles(): Int {
+            val raw = File(directory, "raw")
+            return if (raw.isDirectory) raw.walkTopDown().count { it.isFile && !it.name.endsWith(".part") } else 0
+        }
+        private fun sumRawBytes(): Long {
+            val raw = File(directory, "raw")
+            return if (raw.isDirectory) raw.walkTopDown().filter { it.isFile && !it.name.endsWith(".part") }.sumOf { it.length() } else 0L
+        }
     }
 
     companion object {
