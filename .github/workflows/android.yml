@@ -35,30 +35,53 @@ jobs:
         run: |
           set -o pipefail
           gradle :app:compileDebugKotlin --stacktrace --info 2>&1 | tee kotlin-compile.log
-      - name: Persist failed Kotlin diagnostics on current workbench branch
-        if: steps.kotlin_compile.outcome == 'failure' && github.event_name == 'push'
+      - name: Test debug unit tests and capture exact diagnostics
+        id: unit_test
+        if: always() && steps.kotlin_compile.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle :app:testDebugUnitTest --stacktrace --info 2>&1 | tee unit-test.log
+      - name: Assemble debug APK and capture exact diagnostics
+        id: assemble_debug
+        if: always() && steps.kotlin_compile.outcome == 'success' && steps.unit_test.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle :app:assembleDebug --stacktrace --info 2>&1 | tee assemble-debug.log
+      - name: Persist failed diagnostics on current workbench branch
+        if: always() && github.event_name == 'push' && (steps.kotlin_compile.outcome == 'failure' || steps.unit_test.outcome == 'failure' || steps.assemble_debug.outcome == 'failure')
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ github.sha }}
           SOURCE_BRANCH: ${{ github.ref_name }}
         shell: bash
         run: |
-          test -s kotlin-compile.log
           mkdir -p ci-diagnostics
-          cp kotlin-compile.log "ci-diagnostics/kotlin-compile-${SOURCE_SHA}.log"
+          if [[ "${{ steps.kotlin_compile.outcome }}" == "failure" ]]; then
+            test -s kotlin-compile.log
+            cp kotlin-compile.log "ci-diagnostics/kotlin-compile-${SOURCE_SHA}.log"
+          fi
+          if [[ "${{ steps.unit_test.outcome }}" == "failure" ]]; then
+            test -s unit-test.log
+            cp unit-test.log "ci-diagnostics/unit-test-${SOURCE_SHA}.log"
+          fi
+          if [[ "${{ steps.assemble_debug.outcome }}" == "failure" ]]; then
+            test -s assemble-debug.log
+            cp assemble-debug.log "ci-diagnostics/assemble-debug-${SOURCE_SHA}.log"
+          fi
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add "ci-diagnostics/kotlin-compile-${SOURCE_SHA}.log"
-          git commit -m "Persist Kotlin diagnostics for ${SOURCE_SHA} [skip ci]"
+          git add ci-diagnostics/
+          git commit -m "Persist Android diagnostics for ${SOURCE_SHA} [skip ci]"
           git push origin "HEAD:${SOURCE_BRANCH}"
-      - name: Fail after Kotlin diagnostics are persisted
-        if: steps.kotlin_compile.outcome == 'failure'
+      - name: Restore real CI failure result
+        if: always() && (steps.kotlin_compile.outcome == 'failure' || steps.unit_test.outcome == 'failure' || steps.assemble_debug.outcome == 'failure')
         run: exit 1
-      - name: Test debug unit tests
-        run: gradle :app:testDebugUnitTest --stacktrace
-      - name: Assemble debug APK
-        run: gradle :app:assembleDebug --stacktrace
       - name: Verify debug APK
+        if: steps.assemble_debug.outcome == 'success'
         run: |
           test -f app/build/outputs/apk/debug/app-debug.apk
           sha256sum app/build/outputs/apk/debug/app-debug.apk
