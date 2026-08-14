@@ -5,60 +5,47 @@ on:
     branches: ["main", "workbench/**"]
   pull_request:
     branches: ["main"]
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
       - name: Install Android SDK 35
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
-      - uses: gradle/actions/setup-gradle@v4
+        shell: bash
+        run: yes | sdkmanager --licenses >/dev/null && sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
-      - name: Resolve Android dependencies
-        run: gradle :app:dependencies --configuration debugRuntimeClasspath --stacktrace
-      - name: Process Android resources
-        run: gradle :app:processDebugResources --stacktrace
-      - name: Compile Kotlin and capture exact diagnostics
-        id: kotlin_compile
-        continue-on-error: true
+
+      - name: Compile, test, and assemble debug APK
         shell: bash
-        run: |
-          set -o pipefail
-          gradle :app:compileDebugKotlin --stacktrace --info 2>&1 | tee kotlin-compile.log
-      - name: Persist failed Kotlin diagnostics on current workbench branch
-        if: steps.kotlin_compile.outcome == 'failure' && github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ github.sha }}
-          SOURCE_BRANCH: ${{ github.ref_name }}
-        shell: bash
-        run: |
-          test -s kotlin-compile.log
-          mkdir -p ci-diagnostics
-          cp kotlin-compile.log "ci-diagnostics/kotlin-compile-${SOURCE_SHA}.log"
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add "ci-diagnostics/kotlin-compile-${SOURCE_SHA}.log"
-          git commit -m "Persist Kotlin diagnostics for ${SOURCE_SHA} [skip ci]"
-          git push origin "HEAD:${SOURCE_BRANCH}"
-      - name: Fail after Kotlin diagnostics are persisted
-        if: steps.kotlin_compile.outcome == 'failure'
-        run: exit 1
-      - name: Test debug unit tests
-        run: gradle :app:testDebugUnitTest --stacktrace
-      - name: Assemble debug APK
-        run: gradle :app:assembleDebug --stacktrace
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug --stacktrace
+
       - name: Verify debug APK
+        shell: bash
         run: |
           test -f app/build/outputs/apk/debug/app-debug.apk
           sha256sum app/build/outputs/apk/debug/app-debug.apk
