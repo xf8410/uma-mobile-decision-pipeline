@@ -22,6 +22,7 @@ class DecodedResultsActivity : ComponentActivity() {
     private val executor = Executors.newSingleThreadExecutor()
     private val derivationCore = TrainingStateDerivationCore()
     private val orderingModel = SessionRecordOrderingModel()
+    private val derivedValidator = TrainingStateDerivedValidator()
     private lateinit var content: LinearLayout
     private lateinit var status: TextView
 
@@ -36,7 +37,7 @@ class DecodedResultsActivity : ComponentActivity() {
     }
 
     private fun deriveButton() = Button(this).apply {
-        text = "从已解码文件生成版本化 TrainingState 证据"
+        text = "从已解码文件生成并验证 TrainingState 证据"
         setOnClickListener { deriveTrainingState() }
     }
 
@@ -62,7 +63,7 @@ class DecodedResultsActivity : ComponentActivity() {
     private fun deriveTrainingState() {
         val sessionId = selectedSession()
         if (sessionId.isNullOrBlank()) { status.text = "尚未选择历史 Session"; return }
-        status.text = "正在生成版本化 TrainingState 证据，raw 和 decoded 文件保持不变……"
+        status.text = "正在生成并验证版本化 TrainingState 证据，raw 和 decoded 文件保持不变……"
         executor.execute {
             val result = runCatching { derive(sessionId) }.fold(
                 { it },
@@ -82,7 +83,7 @@ class DecodedResultsActivity : ComponentActivity() {
         val candidates = ArrayList<SortableTrainingState>()
         val errors = JSONArray()
         var inspected = 0
-        var matched = 0
+        var candidatesMatched = 0
         filesRoot.walkTopDown().filter { it.isFile && it.extension == "json" }.forEach { file ->
             inspected++
             val relative = file.relativeTo(File(filesDir, "sessions")).path
@@ -90,13 +91,13 @@ class DecodedResultsActivity : ComponentActivity() {
                 val wrapper = JSONTokener(file.readText(Charsets.UTF_8)).nextValue()
                 val decodedData = if (wrapper is JSONObject && wrapper.has("data")) wrapper.opt("data") else wrapper
                 val located = derivationCore.locateTrainingData(decodedData) ?: return@forEach
+                candidatesMatched++
                 val meta = (wrapper as? JSONObject)?.optJSONObject("_meta")
                 val sourceRaw = metaValue(meta, "source_raw")
                 val sourceRawSha256 = metaValue(meta, "sha256")
-                matched++
                 val state = derivationCore.deriveState(
                     sessionId = sessionId,
-                    derivationIndex = matched,
+                    candidateIndex = candidatesMatched,
                     sourceFile = relative,
                     sourceDecodedSha256 = sha256(file),
                     sourceRaw = sourceRaw,
@@ -105,7 +106,7 @@ class DecodedResultsActivity : ComponentActivity() {
                 )
                 val rawPath = (sourceRaw as? String)?.replace('\\', '/')
                 candidates += SortableTrainingState(
-                    originalTraversalIndex = matched,
+                    originalTraversalIndex = candidatesMatched,
                     state = state,
                     metadata = rawPath?.let { metadataByRawPath[it] },
                 )
@@ -122,6 +123,7 @@ class DecodedResultsActivity : ComponentActivity() {
         }
         val ordered = orderingModel.order(candidates)
         val output = JSONArray().apply { ordered.records.forEach { put(it.state) } }
+        val statesEmitted = output.length()
         val derived = File(root, "derived")
         atomicWrite(File(derived, "training-state.jsonl"), lines(output))
         atomicWrite(File(derived, "training-state-errors.json"), errors.toString().toByteArray(Charsets.UTF_8))
@@ -134,15 +136,20 @@ class DecodedResultsActivity : ComponentActivity() {
             put("raw_preserved", true)
             put("decoded_preserved", true)
             put("files_inspected", inspected)
-            put("states_emitted", matched)
+            put("candidates_matched", candidatesMatched)
+            put("states_emitted", statesEmitted)
             put("errors", errors.length())
             put("selection_gate", "one object directly contains chara_info and at least one *_data_set")
+            put("candidate_index_policy", "1-based order of matching source candidates before derivation; gaps in emitted records indicate retained derivation errors")
             put("ordering_basis", ordered.basis.serialized)
             put("ordering_policy", ordered.policy)
             put("field_policy", "awaiting_real_session_validation semantic mappings; missing values remain null; every emitted value links to decoded and raw evidence")
             put("synthetic_validation", "passed; test-only and not evidence of game semantics")
         }.toString().toByteArray(Charsets.UTF_8))
-        return "TrainingState 证据生成完成\nsession_id=$sessionId\nfiles_inspected=$inspected\nstates_emitted=$matched\nerrors=${errors.length()}\nordering_basis=${ordered.basis.serialized}\nmapping_version=${derivationCore.mappingVersion}\nderived/training-state.jsonl\nderived/field-mapping.v${derivationCore.mappingVersion}.json\nderived/training-state-manifest.json\nderived/training-state-errors.json"
+
+        val validation = derivedValidator.validateSession(root)
+        val validationStatus = if (validation.valid) "通过" else "失败（派生文件已保留）"
+        return "TrainingState 证据生成与验证完成\nsession_id=$sessionId\nfiles_inspected=$inspected\ncandidates_matched=$candidatesMatched\nstates_emitted=$statesEmitted\nderivation_errors=${errors.length()}\nordering_basis=${ordered.basis.serialized}\nmapping_version=${derivationCore.mappingVersion}\nvalidation=$validationStatus\nrecords_checked=${validation.recordsChecked}\nrecords_valid=${validation.recordsValid}\nvalidation_issues=${validation.issues.length()}\nderived/training-state.jsonl\nderived/field-mapping.v${derivationCore.mappingVersion}.json\nderived/training-state-manifest.json\nderived/training-state-errors.json\nderived/training-state-validation.json"
     }
 
     private fun readOrderingMetadata(sessionRoot: File): Map<String, ConfirmedOrderingMetadata> {
@@ -365,13 +372,13 @@ internal class TrainingStateDerivationCore {
         return null
     }
 
-    fun deriveState(sessionId: String, derivationIndex: Int, sourceFile: String, sourceDecodedSha256: String, sourceRaw: Any, sourceRawSha256: Any, located: LocatedTrainingData): JSONObject {
+    fun deriveState(sessionId: String, candidateIndex: Int, sourceFile: String, sourceDecodedSha256: String, sourceRaw: Any, sourceRawSha256: Any, located: LocatedTrainingData): JSONObject {
         val chara = located.value.optJSONObject("chara_info") ?: throw IllegalArgumentException("located object no longer contains chara_info")
         val dataSetKeys = objectKeys(located.value).filter { it.endsWith("_data_set") }
         if (dataSetKeys.isEmpty()) throw IllegalArgumentException("located object no longer contains *_data_set")
         return JSONObject().apply {
             put("schema_version", schemaVersion); put("mapping_version", mappingVersion); put("session_id", sessionId)
-            put("derivation_index", derivationIndex); put("source_file", sourceFile); put("source_file_sha256", sourceDecodedSha256)
+            put("candidate_index", candidateIndex); put("source_file", sourceFile); put("source_file_sha256", sourceDecodedSha256)
             put("source_raw", sourceRaw); put("source_raw_sha256", sourceRawSha256)
             fieldMappings.forEach { mapping -> put(mapping.target, mappedValue(chara, mapping)) }
             put("training_data_sets", stringArray(dataSetKeys))
@@ -404,6 +411,7 @@ internal class TrainingStateDerivationCore {
         check(state.getInt("speed") == 0); check(state.isNull("vital")); check(state.getJSONArray("event_data").toString() == duplicateEvents.toString())
         check(located.value.getJSONObject("unknown_fixture_field").getBoolean("kept")); check(state.getJSONArray("training_data_sets").getString(0) == "synthetic_data_set")
         check(state.getString("mapping_status") == MappingStatus.AWAITING_REAL_SESSION_VALIDATION.serialized)
+        check(state.getInt("candidate_index") == 1)
     }
 
     private fun evidenceRefs(decodedFile: String, decodedSha256: String, sourceRaw: Any, sourceRawSha256: Any, located: LocatedTrainingData, chara: JSONObject, dataSetKeys: List<String>): JSONArray = JSONArray().apply {
