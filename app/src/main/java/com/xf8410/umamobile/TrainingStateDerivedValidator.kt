@@ -9,10 +9,7 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 
-/**
- * Validates derived TrainingState records without modifying raw, decoded, or derived facts.
- * Every failure is retained in the report; incomplete records are never discarded.
- */
+/** Validates derived TrainingState records without modifying raw, decoded, or derived facts. */
 internal class TrainingStateDerivedValidator {
     data class ValidationResult(
         val recordsChecked: Int,
@@ -30,7 +27,6 @@ internal class TrainingStateDerivedValidator {
         }
     }
 
-    /** Validates all records and atomically persists a complete validation report. */
     fun validateSession(sessionRoot: File): ValidationResult {
         val statesFile = File(sessionRoot, "derived/training-state.jsonl")
         val issues = JSONArray()
@@ -61,7 +57,7 @@ internal class TrainingStateDerivedValidator {
 
     private fun validateRecord(sessionRoot: File, record: Int, state: JSONObject, issues: JSONArray) {
         val decodedPath = requiredString(state, "source_file", record, issues) ?: return
-        val decoded = resolveSessionPath(sessionRoot, decodedPath)
+        val decoded = resolveSessionPath(sessionRoot, decodedPath, record, issues) ?: return
         if (!decoded.isFile) {
             issue(issues, record, "missing_source_decoded", decodedPath, "source decoded file does not exist")
             return
@@ -72,9 +68,11 @@ internal class TrainingStateDerivedValidator {
         if (rawPath == null) {
             issue(issues, record, "missing_source_raw_reference", "source_raw", "source raw reference is null or absent")
         } else {
-            val raw = resolveSessionPath(sessionRoot, rawPath)
-            if (!raw.isFile) issue(issues, record, "missing_source_raw", rawPath, "source raw file does not exist")
-            else verifyHash(state, "source_raw_sha256", raw, record, "raw_sha256_mismatch", issues)
+            val raw = resolveSessionPath(sessionRoot, rawPath, record, issues)
+            if (raw != null) {
+                if (!raw.isFile) issue(issues, record, "missing_source_raw", rawPath, "source raw file does not exist")
+                else verifyHash(state, "source_raw_sha256", raw, record, "raw_sha256_mismatch", issues)
+            }
         }
 
         val decodedRoot = try {
@@ -100,14 +98,7 @@ internal class TrainingStateDerivedValidator {
         }
     }
 
-    private fun validateReference(
-        record: Int,
-        state: JSONObject,
-        decodedRoot: JSONObject,
-        ref: JSONObject,
-        refIndex: Int,
-        issues: JSONArray,
-    ) {
+    private fun validateReference(record: Int, state: JSONObject, decodedRoot: JSONObject, ref: JSONObject, refIndex: Int, issues: JSONArray) {
         val target = nullableString(ref, "target")
         if (target == null) {
             issue(issues, record, "missing_evidence_target", "evidence_refs[$refIndex].target", "target is absent")
@@ -132,8 +123,6 @@ internal class TrainingStateDerivedValidator {
             issue(issues, record, "missing_derived_target", target, "derived record does not contain evidence target")
             return
         }
-
-        // training_data_sets stores source object keys rather than copying each data-set value.
         val derivedValue = state.opt(target)
         val equal = if (target == "training_data_sets") {
             derivedValue is JSONArray && jsonArrayContainsString(derivedValue, finalPathToken(path))
@@ -150,8 +139,7 @@ internal class TrainingStateDerivedValidator {
             if (path[offset] == '[') {
                 val end = path.indexOf(']', offset + 1)
                 if (end < 0) throw IllegalArgumentException("unterminated array index at $offset")
-                val index = path.substring(offset + 1, end).toIntOrNull()
-                    ?: throw IllegalArgumentException("invalid array index at $offset")
+                val index = path.substring(offset + 1, end).toIntOrNull() ?: throw IllegalArgumentException("invalid array index at $offset")
                 val array = current as? JSONArray ?: throw IllegalArgumentException("expected array before index $index")
                 if (index !in 0 until array.length()) throw IllegalArgumentException("array index $index is out of bounds")
                 current = array.get(index)
@@ -178,10 +166,22 @@ internal class TrainingStateDerivedValidator {
         }
     }
 
-    private fun resolveSessionPath(sessionRoot: File, recordedPath: String): File {
+    private fun resolveSessionPath(sessionRoot: File, recordedPath: String, record: Int, issues: JSONArray): File? {
         val normalized = recordedPath.replace('\\', '/')
+        if (normalized.isBlank() || normalized.startsWith('/')) {
+            issue(issues, record, "invalid_source_path", recordedPath, "source path must be a non-empty relative Session path")
+            return null
+        }
         val prefix = sessionRoot.name + "/"
-        return File(sessionRoot, if (normalized.startsWith(prefix)) normalized.removePrefix(prefix) else normalized)
+        val relative = if (normalized.startsWith(prefix)) normalized.removePrefix(prefix) else normalized
+        val root = sessionRoot.canonicalFile
+        val resolved = File(root, relative).canonicalFile
+        val rootPath = root.toPath()
+        if (resolved.toPath() == rootPath || !resolved.toPath().startsWith(rootPath)) {
+            issue(issues, record, "source_path_escaped_session", recordedPath, "source path resolves outside the Session root")
+            return null
+        }
+        return resolved
     }
 
     private fun requiredString(value: JSONObject, key: String, record: Int, issues: JSONArray): String? =
@@ -197,7 +197,6 @@ internal class TrainingStateDerivedValidator {
         return false
     }
 
-    /** Structural comparison retains nulls, zeroes, array order, and duplicate array entries. */
     private fun jsonEqual(left: Any?, right: Any?): Boolean = when {
         left === JSONObject.NULL && right === JSONObject.NULL -> true
         left is JSONObject && right is JSONObject -> left.toString() == right.toString()
